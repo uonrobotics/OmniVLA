@@ -4,11 +4,33 @@ train_omnivla.py
 Train or finetune OmniVLA with LoRA.
 """
 
+"""
+🔵 1) LoRA 파인튜닝
+TRAIN_MODE=True
+--train_policy False
+--use_lora True
+
+🔴 2) Policy Only 학습
+TRAIN_MODE=True
+--train_policy True
+--use_lora False
+
+→ VLA 완전 freeze
+→ action_head + pose_projector만 학습
+
+🟡 3) 디버그 모드
+TRAIN_MODE = False
+
+→ no backward
+→ no grad
+→ visualization만
+"""
+
 # ==============================
 # Configuration Flags
 # ==============================
-TRAIN_MODE = False   # True: training mode, False: debug mode (minimize GPU RAM usage)
-VISUALIZE = True    # True: save visualization images of policy performance
+TRAIN_MODE = True   # True: training mode, False: debug mode (minimize GPU RAM usage)
+VISUALIZE = False   # True: save visualization images of policy performance
 
 # ==============================
 # Path Setup
@@ -19,6 +41,7 @@ from pathlib import Path
 # Add external project paths if not installed as packages
 sys.path.extend([
     "../Learning-to-Drive-Anywhere-with-MBRA/train/",
+    "../lerobot/src/",
 ])
 
 # ==============================
@@ -99,6 +122,7 @@ from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM, IGNORE_INDEX
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.dummy_dataset import Dummy_Dataset
+from prismatic.vla.datasets.uonamr_dataset import UONAMR_Dataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
 from vint_train.models.exaug.exaug import ExAug_dist_delay
@@ -150,6 +174,8 @@ class OmniVLAConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
+    
+    train_policy: bool = False                       # True면 VLA freeze + action_head/pose_projector만 학습
 
 def remove_ddp_in_checkpoint(state_dict) -> dict:
     new_state_dict = {}
@@ -711,7 +737,15 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
     Returns:
         None.
     """
-    assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
+    if not cfg.train_policy:
+        assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
+    else:
+        if cfg.use_lora:
+            print(
+                "[WARN] train_policy=True 인데 use_lora=True 입니다.\n"
+                "VLA를 freeze하므로 LoRA는 학습되지 않습니다.\n"
+                "--use_lora=False 권장."
+            )
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
@@ -892,7 +926,7 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
     # For goal pose conditioning
     NUM_PATCHES += 1
 
-    if not TRAIN_MODE:
+    if cfg.train_policy or not TRAIN_MODE:
         for param in vla.parameters():
             param.requires_grad = False
                 
@@ -925,59 +959,85 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
         
     )
 
-    #Data loader and sampler setting (I provide the sample dataloader. Please replace this dataloader with your dataset. Following sample code, you can combine the mutiple datasets.)        
-    train_dataset_dummy = []
-    test_dataset_dummy = []    
-    for data_split_type in ["train", "test"]:   
-        #dummy dataset
-        dataset_dummy = Dummy_Dataset(   
-            context_size = config["context_size"],             
-            action_tokenizer=action_tokenizer,
-            base_tokenizer=processor.tokenizer, 
-            image_transform=processor.image_processor.apply_transform,
-            prompt_builder_fn=PurePromptBuilder,                                                                         
-        ) 
-        if data_split_type == "train":
-            train_dataset_dummy.append(dataset_dummy)
-        elif data_split_type == "test":
-            test_dataset_dummy.append(dataset_dummy)
-                    
-        if data_split_type == "train":                   
-            train_dataset_dummy = ConcatDataset(train_dataset_dummy)
-            sampler_train_dummy = DistributedSampler(train_dataset_dummy, num_replicas=world_size, rank=device_id, shuffle=True) 
-                
-            train_loader_dummy = DataLoader(
-                train_dataset_dummy,
-                batch_size=cfg.batch_size,
-                shuffle=False,
-                collate_fn=collator,
-                num_workers=8,
-                drop_last=True,
-                persistent_workers=True,
-                sampler=sampler_train_dummy,
-            )                  
-        else:
-            test_dataset_dummy = ConcatDataset(test_dataset_dummy) 
-            sampler_test_dummy = DistributedSampler(test_dataset_dummy, num_replicas=world_size, rank=device_id, shuffle=True)                 
+    # ------------------------------------------------------------
+    # Data loader and sampler setting
+    #   - cfg.dataset_name == "uon_amr"  -> UONAMR_Dataset 사용
+    #   - else                           -> Dummy_Dataset 사용
+    # ------------------------------------------------------------
+    train_datasets = []
+    test_datasets = []
 
-            test_loader_dummy = DataLoader(
-                test_dataset_dummy,
-                batch_size=cfg.batch_size,
-                shuffle=False,
-                collate_fn=collator,
-                num_workers=8,
-                drop_last=True,
-                persistent_workers=True,
-                sampler=sampler_train_dummy,
+    for split in ["train", "test"]:
+        if cfg.dataset_name == "uon_amr":
+            ds = UONAMR_Dataset(
+                root=cfg.data_root_dir,
+                action_tokenizer=action_tokenizer,
+                base_tokenizer=processor.tokenizer,
+                image_transform=processor.image_processor.apply_transform,
+                prompt_builder_fn=PurePromptBuilder,
+                modality=7,  #here change modality id           
+                dataset_framerate=15, 
+                action_horizon=8,
+                len_traj_pred=8,
+                context_size=5,
+                context_spacing=1,
+                action_spacing=1,
+                predict_stop_token=True,
             )
+        else:
+            ds = Dummy_Dataset(
+                context_size=config["context_size"],
+                action_tokenizer=action_tokenizer,
+                base_tokenizer=processor.tokenizer,
+                image_transform=processor.image_processor.apply_transform,
+                prompt_builder_fn=PurePromptBuilder,
+            )
+
+        if split == "train":
+            train_datasets.append(ds)
+        else:
+            test_datasets.append(ds)
+
+    # ---- Concat + Sampler + Loader ----
+    train_dataset = ConcatDataset(train_datasets)
+    test_dataset = ConcatDataset(test_datasets)
+
+    sampler_train = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=device_id, shuffle=True
+    )
+    sampler_test = DistributedSampler(
+        test_dataset, num_replicas=world_size, rank=device_id, shuffle=False
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=8,
+        drop_last=True,
+        persistent_workers=True,
+        sampler=sampler_train,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=8,
+        drop_last=True,
+        persistent_workers=True,
+        sampler=sampler_test,
+    )
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_metrics = {
-        "loss_value": deque(maxlen=cfg.grad_accumulation_steps),
-        "L2_action_value": deque(maxlen=cfg.grad_accumulation_steps),        
-        "L2_obj_value": deque(maxlen=cfg.grad_accumulation_steps),
-        "L2_smooth_value": deque(maxlen=cfg.grad_accumulation_steps),             
-        "L2_sate": deque(maxlen=cfg.grad_accumulation_steps),
+        "loss_value": deque(maxlen=cfg.grad_accumulation_steps),         # 최종 학습 loss
+        "L2_action_value": deque(maxlen=cfg.grad_accumulation_steps),    # trajectory regression
+        "L2_obj_value": deque(maxlen=cfg.grad_accumulation_steps),       # object goal alignment loss 
+        "L2_smooth_value": deque(maxlen=cfg.grad_accumulation_steps),    # trajectory smoothness loss
+        "L2_sate": deque(maxlen=cfg.grad_accumulation_steps),            # 각각 modality 에 대한 loss --------
         "L2_sate_pose": deque(maxlen=cfg.grad_accumulation_steps),        
         "L2_sate_img": deque(maxlen=cfg.grad_accumulation_steps),
         "L2_sate_pose_img": deque(maxlen=cfg.grad_accumulation_steps),   
@@ -985,12 +1045,12 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
         "L2_pose_img": deque(maxlen=cfg.grad_accumulation_steps),
         "L2_img": deque(maxlen=cfg.grad_accumulation_steps),       
         "L2_lan": deque(maxlen=cfg.grad_accumulation_steps),          
-        "L2_lan_pose": deque(maxlen=cfg.grad_accumulation_steps),                                            
+        "L2_lan_pose": deque(maxlen=cfg.grad_accumulation_steps),        # 각각 modality 에 대한 loss --------                                    
     }
 
     #You can list your all training datasets. In this example, we list same two dummy data loaders.
-    iters = [iter(train_loader_dummy), iter(train_loader_dummy)]
-    samplers = [sampler_train_dummy, sampler_train_dummy]     
+    iters = [iter(train_loader)]
+    samplers = [sampler_train]
                  
     log_count = 0
     for epoch in range(100):
@@ -1000,9 +1060,19 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
         with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
             if TRAIN_MODE:
                 print("setting up training mode")
-                vla.train()
+
+                if cfg.train_policy:
+                    # policy-only → VLA freeze + eval 유지
+                    vla.eval()
+                else:
+                    # full LoRA training
+                    vla.train()
+
+                action_head.train()
+                pose_projector.train()
+
             else:
-                print("setting up eval (Local PC coding) mode")
+                print("setting up debug mode")
                 vla.eval()
                 action_head.eval()
                 pose_projector.eval()
@@ -1014,7 +1084,7 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
                     try:
                         batch = next(it)
                     except StopIteration:
-                        iters[i] = iter([iter(train_loader_dummy), iter(train_loader_dummy)][i])
+                        iters[i] = iter(train_loader)
                         batch = next(iters[i])
                     batches.append(batch)
                 
