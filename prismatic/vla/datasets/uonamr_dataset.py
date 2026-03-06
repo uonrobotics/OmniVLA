@@ -1,11 +1,14 @@
 import torch
+import random
+
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, Type, Optional, List, Union
+from typing import Dict, Any, Type
+from PIL import Image
 
-from torchvision.transforms.functional import to_pil_image, resize, to_tensor
+from torchvision.transforms.functional import to_pil_image
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.video_utils import decode_video_frames
+import einops
 
 from prismatic.vla.constants import IGNORE_INDEX
 from prismatic.models.backbones.llm.prompting import PromptBuilder
@@ -13,17 +16,46 @@ from prismatic.vla.action_tokenizer import ActionTokenizer
 from transformers import PreTrainedTokenizerBase
 from prismatic.models.backbones.vision import ImageTransform
 
-# Repo 기준 modality id (train_omnivla.py 내부 마스킹/통계가 0~8 기반이라 9는 비추)
-IMAGE_ONLY = 6
-LANGUAGE_ONLY = 7
-LANGUAGE_AND_POSE = 8
+
+def trans_mat(
+    pos: float | np.ndarray | torch.Tensor, yaw: float | np.ndarray | torch.Tensor
+) -> np.ndarray | torch.Tensor:
+    """Return homogeneous transform matrix for position and yaw."""
+    if isinstance(yaw, torch.Tensor):
+        return torch.tensor(
+            [
+                [torch.cos(yaw), -torch.sin(yaw), pos[0]],
+                [torch.sin(yaw), torch.cos(yaw), pos[1]],
+                [torch.zeros_like(yaw), torch.zeros_like(yaw), torch.ones_like(yaw)],
+            ]
+        )
+    else:
+        return np.array(
+            [
+                [np.cos(yaw), -np.sin(yaw), pos[0]],
+                [np.sin(yaw), np.cos(yaw), pos[1]],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+
+def to_local_coords_yaw(
+    positions: np.ndarray | torch.Tensor,
+    curr_pos: np.ndarray | torch.Tensor,
+    curr_yaw: float | np.ndarray | torch.Tensor,
+    goal_yaw: float | np.ndarray | torch.Tensor,
+) -> np.ndarray | torch.Tensor:
+    """
+    Return relative transform matrix between current frame (curr_pos, curr_yaw)
+    and goal frame defined by positions[0] and goal_yaw.
+    """
+    cur_mat = trans_mat(curr_pos, curr_yaw)
+    goal_mat = trans_mat(positions[0], goal_yaw)
+    cur_mat_inv = torch.linalg.inv(cur_mat) if isinstance(cur_mat, torch.Tensor) else np.linalg.inv(cur_mat)
+    return cur_mat_inv @ goal_mat
 
 
 class UONAMR_Dataset(LeRobotDataset):
     """
-    OmniVLA (NHirose/OmniVLA) train_omnivla.py + PaddedCollatorForActionPrediction_Nav_MMN
-    파이프라인에 맞춘 최종 호환 Dataset (LeRobot 기반).
-
     반환 dict (중요 키/타입):
       - pixel_values: torch.FloatTensor
       - pixel_values_goal: torch.FloatTensor
@@ -49,294 +81,318 @@ class UONAMR_Dataset(LeRobotDataset):
         image_transform: ImageTransform,
         prompt_builder_fn: Type[PromptBuilder],
         root: Path,
-        modality: int = LANGUAGE_ONLY,  # 안전 default
         predict_stop_token: bool = True,
-        action_horizon: int = 8,
-        action_spacing: int = 1,
+        metric_spacing: float = 0.1,
+        action_horizon: int = 8, # = waypoint spacing
+        action_spacing: int = 3, # 15 framerate 기준 0.2초 간격
         context_size: int = 5,
-        context_spacing: int = 1,
-        dataset_framerate: int = 15,   # 너 조건: episode마다 15fps 고정
-        len_traj_pred: int = 8,        # action horizon과 동일하게 권장
-        max_v: float = 0.5,
-        instruction_prefix: str = "Instruction: ",
-        default_instruction: str = "Navigate to the goal.",
-        mbra_image_hw: int = 96,
-        goal_as_last_frame: bool = True,
+        context_spacing: int = 3, # 15 framerate 기준 0.2초 간격
+        dataset_framerate: int = 15,  
+        len_traj_pred: int = 8,       
     ):
         self.dt = 1.0 / float(dataset_framerate)
-        self.action_spacing = int(action_spacing)
-        self.action_horizon = int(action_horizon)
-        self.context_size = int(context_size)
-        self.context_spacing = int(context_spacing)
-        self.modality = int(modality)
 
         self.action_tokenizer = action_tokenizer
         self.base_tokenizer = base_tokenizer
         self.image_transform = image_transform
         self.prompt_builder_fn = prompt_builder_fn
         self.predict_stop_token = bool(predict_stop_token)
-
+        
+        self.metric_spacing = float(metric_spacing)
+        self.action_horizon = int(action_horizon)
+        self.action_spacing = int(action_spacing)
+        self.context_size = int(context_size)
+        self.context_spacing = int(context_spacing)
         self.len_traj_pred = int(len_traj_pred)
-        self.max_v = float(max_v)
-
-        self.instruction_prefix = instruction_prefix
-        self.default_instruction = default_instruction
-
-        self.mbra_image_hw = int(mbra_image_hw)
-        self.goal_as_last_frame = bool(goal_as_last_frame)
 
         super().__init__(
             repo_id="uon_amr",
-            download_videos=True,
+            download_videos=False,
             root=root,
-            delta_timestamps={
-                "observation.images.front_rgb": [
-                    i * self.context_spacing * self.dt for i in range(-self.context_size, 1)
-                ],
-                "action": [i * self.action_spacing * self.dt for i in range(self.action_horizon)],
-            },
-        )
+        )      
+        
+        # # dataset cache stored as zarr array -> keep as numpy arrays for speed
+        # self.dataset_cache = zarr.load(Path(root) / "uon_dataset" / "dataset_cache.zarr")
+        # self.dataset_cache = {k: np.asarray(v) for k, v in self.dataset_cache.items()}
 
-    # --------------------------
-    # Action: (v,w) -> (x,y,cos,sin)
-    # --------------------------
-    def integrate_velocity(self, actions_vw: torch.Tensor) -> torch.Tensor:
-        """
-        actions_vw: (H,2) torch
-        returns:    (H,4) torch float32
-        """
-        H = actions_vw.shape[0]
-        positions = torch.zeros((H + 1, 2), dtype=torch.float32)
-        headings = torch.zeros(H + 1, dtype=torch.float32)
+        # self.global_positions = np.zeros((len(self.dataset_cache["linear_velocity"]), 2))
+        # self.global_headings = np.zeros(len(self.dataset_cache["angular_velocity"]))
 
-        for i in range(1, H + 1):
-            v = actions_vw[i - 1, 0]
-            w = actions_vw[i - 1, 1]
-            direction = torch.tensor(
-                [torch.cos(headings[i - 1]), torch.sin(headings[i - 1])],
-                dtype=torch.float32,
-            )
-            positions[i] = positions[i - 1] + v * direction * self.dt
-            headings[i] = headings[i - 1] + w * self.dt
+        # # 모든 에피소드를 순회하며 전역 좌표 적분
+        # for ep_id in range(self.num_episodes):
+        #     start = self.episode_data_index["from"][ep_id]
+        #     end = self.episode_data_index["to"][ep_id]
+            
+        #     v_ep = self.dataset_cache["linear_velocity"][start:end]
+        #     w_ep = self.dataset_cache["angular_velocity"][start:end]
+            
+        #     curr_x, curr_y, curr_theta = 0.0, 0.0, 0.0
+        #     for i, (v, w) in enumerate(zip(v_ep, w_ep)):
+        #         # 전역 좌표 저장
+        #         self.global_positions[start + i] = [curr_x, curr_y]
+        #         self.global_headings[start + i] = curr_theta
+                
+        #         # 다음 스텝 적분
+        #         curr_x += v * np.cos(curr_theta) * self.dt
+        #         curr_y += v * np.sin(curr_theta) * self.dt
+        #         curr_theta += w * self.dt
+                
+    # # --------------------------
+    # # Action: (v,w) -> (x,y,cos,sin)
+    # # --------------------------
+    # def integrate_velocity(self, actions_vw: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     actions_vw: (H,2) torch
+    #     returns:    (H,4) torch float32
+    #     """
+    #     H = actions_vw.shape[0]
+    #     positions = torch.zeros((H + 1, 2), dtype=torch.float32)
+    #     headings = torch.zeros(H + 1, dtype=torch.float32)
 
-        future_pos = positions[1:]
-        future_headings = headings[1:]
+    #     for i in range(1, H + 1):
+    #         v = actions_vw[i - 1, 0]
+    #         w = actions_vw[i - 1, 1]
+    #         direction = torch.tensor(
+    #             [torch.cos(headings[i - 1]), torch.sin(headings[i - 1])],
+    #             dtype=torch.float32,
+    #         )
+    #         positions[i] = positions[i - 1] + v * direction * self.dt
+    #         headings[i] = headings[i - 1] + w * self.dt
 
-        return torch.stack(
-            [
-                future_pos[:, 0] / self.max_v,
-                future_pos[:, 1] / self.max_v,
-                torch.cos(future_headings),
-                torch.sin(future_headings),
-            ],
-            dim=-1,
-        ).to(torch.float32)
+    #     future_pos = positions[1:]
+    #     future_headings = headings[1:]
 
-    # --------------------------
-    # Frame conversion helpers
-    # --------------------------
-    @staticmethod
-    def _frame_to_pil(frame: Any):
-        if isinstance(frame, torch.Tensor):
-            x = frame
-            if x.ndim == 3 and x.shape[0] in (1, 3):          # (C,H,W)
-                pass
-            elif x.ndim == 3 and x.shape[-1] in (1, 3):       # (H,W,C)
-                x = x.permute(2, 0, 1)
-            else:
-                raise ValueError(f"Unexpected frame tensor shape: {tuple(x.shape)}")
-            return to_pil_image(x.detach().cpu()).convert("RGB")
-
-        if isinstance(frame, np.ndarray):
-            x = frame
-            if x.ndim == 3 and x.shape[-1] in (1, 3):         # (H,W,C)
-                pass
-            elif x.ndim == 3 and x.shape[0] in (1, 3):        # (C,H,W)
-                x = np.transpose(x, (1, 2, 0))
-            else:
-                raise ValueError(f"Unexpected frame np shape: {x.shape}")
-            return to_pil_image(x).convert("RGB")
-
-        raise TypeError(f"Unsupported frame type: {type(frame)}")
-
-    def _make_mbra_images(
-        self,
-        history_frames: Any,
-        goal_pil,
-    ) -> Dict[str, np.ndarray]:
-        """
-        cur_image:    (3*(context_size+1), 96, 96) float32
-        goal_image_8: (3, 96, 96) float32
-        """
-        hw = self.mbra_image_hw
-
-        # history_frames -> list of frames
-        if isinstance(history_frames, torch.Tensor):
-            frames_list = [history_frames[i] for i in range(history_frames.shape[0])]
-        elif isinstance(history_frames, (list, tuple)):
-            frames_list = list(history_frames)
-        elif isinstance(history_frames, np.ndarray):
-            frames_list = [history_frames[i] for i in range(history_frames.shape[0])]
-        else:
-            frames_list = [history_frames]
-
-        needed = self.context_size + 1
-        if len(frames_list) >= needed:
-            frames_list = frames_list[-needed:]
-        else:
-            last = frames_list[-1]
-            frames_list = [last] * (needed - len(frames_list)) + frames_list
-
-        t_list = []
-        for fr in frames_list:
-            pil = self._frame_to_pil(fr)
-            pil = resize(pil, [hw, hw])
-            t_list.append(to_tensor(pil).to(torch.float32))   # (3,hw,hw)
-
-        cur_image = torch.cat(t_list, dim=0)                  # (3*(ctx+1),hw,hw)
-
-        goal_rs = resize(goal_pil, [hw, hw])
-        goal_image = to_tensor(goal_rs).to(torch.float32)     # (3,hw,hw)
-
-        return {
-            "cur_image": cur_image.numpy().astype(np.float32),
-            "goal_image_8": goal_image.numpy().astype(np.float32),
-        }
+    #     return torch.stack(
+    #         [
+    #             future_pos[:, 0] / self.metric_waypoint_spacing, # Normalize  
+    #             future_pos[:, 1] / self.metric_waypoint_spacing, # Normalize
+    #             torch.cos(future_headings), # Trigonometry 적용 
+    #             torch.sin(future_headings), # Trigonometry 적용
+    #         ],
+    #         dim=-1,
+    #     ).to(torch.float32)
 
     # --------------------------
     # Main getitem
     # --------------------------
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         item = super().__getitem__(idx)
-        ep_id = int(item["episode_index"].item())
-        ep_info = self.meta.episodes[ep_id]
+        ep_id = int(item["episode_index"].item()) # 현재 idx 가 속한 episode id        
+        episode_metadata = self.meta.episodes[ep_id]
+        ep_start_idx = episode_metadata["dataset_from_index"]
+        ep_end_idx = episode_metadata["dataset_to_index"]
+        
+        # Context/history 만들기
+        context_indices = []
+        for i in range(-self.context_size, 1):
+            t_idx = idx + (i * self.context_spacing)
+            # 에피소드 시작점보다 작아지면 시작점 프레임으로 패딩 
+            context_indices.append(max(t_idx, ep_start_idx))
+            
+        context_images = []
+        for c_idx in context_indices:
+            c_item = super().__getitem__(c_idx)
+            context_images.append(c_item["observation.images.front_rgb"]) # (3,H,W)
+            
+        context_stack = torch.stack(context_images)  # (T,3,H,W) 형태로 쌓기
+        cur_image_context = einops.rearrange(context_stack, "t c h w -> (t c) h w")  # Flatten channel: (T*3,H,W)
+        
+        # 현재 이미지 = context의 마지막 프레임
+        current_img_tensor = context_images[-1]
 
-        # ---- Language prompt ----
-        lan_prompt = self.default_instruction
-        try:
-            task_idx = int(item["task_index"].item())
-            lan_prompt = str(self.meta.tasks.index[task_idx])
-        except Exception:
-            lan_prompt = self.default_instruction
+        # 에피소드의 마지막 프레임을 goal image 로 사용
+        last_frame_idx = ep_end_idx - 1
+        goal_img_tensor = super().__getitem__(last_frame_idx)["observation.images.front_rgb"]
+        
+        # 전처리
+        pil_current = to_pil_image(current_img_tensor)
+        pil_goal = to_pil_image(goal_img_tensor)
+        
+        pixel_values = self.image_transform(pil_current)
+        pixel_values_goal = self.image_transform(pil_goal)
+        
+        # ---------- Action ----------
+        # 미래 v, w 데이터 로드
+        total_steps_needed = self.action_spacing * self.action_horizon
+        actual_end_idx = int(min(idx + total_steps_needed, ep_end_idx))
+        future_actions_list = self.hf_dataset[idx : actual_end_idx]["action"] 
 
-        # ---- Images: current + goal ----
-        vid_key = "observation.images.front_rgb"
-
-        # current image (history last frame)
-        img_pil = self._frame_to_pil(item[vid_key][-1])
-
-        # goal image: episode 마지막 프레임 사용 (너 로직 유지)
-        video_path = self.root / self.meta.get_video_file_path(ep_id, vid_key)
-
-        if self.goal_as_last_frame:
-            goal_ts = self.hf_dataset[ep_info["dataset_to_index"] - 1]["timestamp"].item()
+        # 리스트 안의 요소가 텐서라면 stack을, 아니라면 as_tensor를 사용해야 함
+        if isinstance(future_actions_list[0], torch.Tensor):
+            future_actions_tensor = torch.stack(future_actions_list)
         else:
-            # fallback: 현재 timestamp를 goal로 (원하면 바꿔)
-            goal_ts = item["timestamp"].item() if "timestamp" in item else 0.0
+            future_actions_tensor = torch.as_tensor(future_actions_list)
 
-        from_ts = float(ep_info.get(f"videos/{vid_key}/from_timestamp", 0.0))
-        goal_raw = decode_video_frames(
-            video_path, [from_ts + float(goal_ts)], tolerance_s=0.0001
-        ).squeeze(0)
+        v_seq = future_actions_tensor[:, 0] 
+        w_seq = future_actions_tensor[:, 1]
 
-        if isinstance(goal_raw, np.ndarray) and goal_raw.ndim == 4:
-            goal_frame = goal_raw[0]
-        else:
-            goal_frame = goal_raw
-
-        gimg_pil = self._frame_to_pil(goal_frame)
-
-        # OmniVLA vision encoder inputs (torch tensors)
-        pixel_values = self.image_transform(img_pil)
-        pixel_values_goal = self.image_transform(gimg_pil)
-
-        # MBRA inputs (numpy)
-        mbra = self._make_mbra_images(item[vid_key], gimg_pil)
-
-        # ---- Actions ----
-        actions_vw = item["action"]
-        if not isinstance(actions_vw, torch.Tensor):
-            actions_vw = torch.tensor(actions_vw)
-
-        # horizon 방어 + 패딩
-        H_raw = int(actions_vw.shape[0])
-        H = min(H_raw, self.len_traj_pred)
-        actions_4d = self.integrate_velocity(actions_vw[:H])
-
-        if H < self.len_traj_pred:
-            pad = actions_4d[-1:].repeat(self.len_traj_pred - H, 1)
-            actions_4d = torch.cat([actions_4d, pad], dim=0)
-
-        # numpy actions (collator 호환)
-        actions_np = actions_4d.detach().cpu().numpy().astype(np.float32)  # (len_traj_pred,4)
-
-        # ---- ActionTokenizer: Frodobots style ----
-        current_action = actions_4d[0]
-        future_actions = actions_4d[1:]
+        # 에피소드 끝 Padding (마지막 속도 유지)
+        if v_seq.shape[0] < total_steps_needed:
+            pad_len = total_steps_needed - v_seq.shape[0]
+            v_pad = v_seq[-1].repeat(pad_len)
+            w_pad = w_seq[-1].repeat(pad_len)
+            v_seq = torch.cat([v_seq, v_pad])
+            w_seq = torch.cat([w_seq, w_pad])
+            
+        # 모은 데이터는 w > 0 일 떄 우회전 --> 표준으로 변환필요: w > 0 일 때 좌회전이 되도록 (y좌표가 좌측+이므로)
+        # !! 로봇 제어 시 계산한 w 값에 -1 곱해서 제어해야 함 !!
+        w_seq = -w_seq
+        
+        # Integrate velocity: (v,w) -> (x,y,cos,sin)
+        curr_x, curr_y, curr_theta = 0.0, 0.0, 0.0
+        action_waypoints = []
+        for i in range(total_steps_needed):
+            v, w = v_seq[i].item(), w_seq[i].item()
+            curr_x += v * np.cos(curr_theta) * self.dt
+            curr_y += v * np.sin(curr_theta) * self.dt
+            curr_theta += w * self.dt
+            
+            if (i + 1) % self.action_spacing == 0:
+                action_waypoints.append([
+                    curr_x / self.metric_spacing,
+                    curr_y / self.metric_spacing,
+                    np.cos(curr_theta),
+                    np.sin(curr_theta)
+                ])
+                
+        actions = torch.tensor(action_waypoints, dtype=torch.float32)
+        
+        # Data augmentation
+        if random.random() > 0.5:
+            # 모델 입력용 이미지 텐서
+            pixel_values = self.image_transform(pil_current.transpose(Image.FLIP_LEFT_RIGHT))
+            pixel_values_goal = self.image_transform(pil_goal.transpose(Image.FLIP_LEFT_RIGHT))
+            cur_image_context = torch.flip(cur_image_context, [2])
+            # 액션 trajectory 반전
+            actions[:, 1] *= -1 # dy 반전
+            actions[:, 3] *= -1 # sin(yaw) 반전
+            # 디버깅/로깅용 PIL 이미지
+            pil_current = pil_current.transpose(Image.FLIP_LEFT_RIGHT)
+            pil_goal = pil_goal.transpose(Image.FLIP_LEFT_RIGHT)
+        
+        # action tokenizer 적용
+        current_action = actions[0]
+        future_actions = actions[1:]
         current_action_string = self.action_tokenizer(current_action)
         future_actions_string = "".join(self.action_tokenizer(future_actions))
         action_chunk_string = current_action_string + future_actions_string
         action_chunk_len = len(action_chunk_string)
-
-        # ---- Prompt: OpenVLA style ----
-        human_query = f"{self.instruction_prefix}{lan_prompt} Reach the destination shown in the goal image."
-
-        conversation = [
-            {"from": "human", "value": human_query},
-            {"from": "gpt", "value": action_chunk_string},
-        ]
-
+        
+        # 1.0: raw action, 0.0: MBRA synthetic action
+        action_select_mask = torch.tensor(1.0)    
+        
+        # # ---------- Goal pose (최종 목적지 상대 좌표 계산) ----------
+        # # 현재와 마지막 지점의 미리 계산된 전역 좌표 불러오기
+        # curr_pos = self.global_positions[idx]
+        # curr_heading = self.global_headings[idx]
+        # goal_pos = self.global_positions[last_frame_idx]
+        # goal_heading = self.global_headings[last_frame_idx]
+        
+        # # 상대 좌표 계산
+        # rel_mat = to_local_coords_yaw(goal_pos[None], curr_pos, curr_heading, goal_heading)
+        # # rel_mat[0,2] = 상대 dx,
+        # # rel_mat[1,2] = 상대 dy,
+        # # rel_mat[1,1] = cos(relative_yaw)
+        # # rel_mat[1,0] = sin(relative_yaw)
+        # goal_pos_cos_sin = np.array([
+        #     rel_mat[0, 2] / self.metric_spacing,  # dx 정규화
+        #     rel_mat[1, 2] / self.metric_spacing,  # dy 정규
+        #     rel_mat[1, 1],                        # cos(relative_yaw)
+        #     rel_mat[1, 0],                        # sin(relative_yaw)
+        # ], dtype=np.float32)
+        
+        # # 목표까지의 거리감
+        # # 현재 위치에서 에피소드 끝까지 몇 스텝 남았는지 계산 (wp 단위)
+        # distance = (last_frame_idx - idx) // self.action_spacing
+        
+        # # 상황에 따라 좌표만 보거나 이미지도 같이 보거나 할 수 있도록 modatliy를 유연하게 적용하는 기법
+        # # 0:"satellite only", 
+        # # 1:"pose and satellite", 
+        # # 2:"satellite and image",
+        # # 3:"all",
+        # # 4:"pose only",
+        # # 5:"pose and image", 
+        # # 6:"image only", 
+        # # 7:"language only", 
+        # # 8:"language and pose"        
+        # modality_list = [4, 5, 7, 8, 6]   
+        # if distance <= 20:
+        #     modality_id = random.choice(modality_list)
+        # else:
+        #     modality_id = random.choice(modality_list[0:4]) #distance is long --> no image only
+                
+        modality_list = [6, 7] 
+        modality_id = random.choice(modality_list)
+        
+        # ---------- Prompt ----------
+        lan_prompt = "XXXX"
+        try:
+            task_idx = int(item["task_index"].item())
+            lan_prompt = str(self.meta.tasks.index[task_idx])
+        except Exception:
+            lan_prompt = "XXXX"
+            
+        if modality_id == 7:
+            conversation = [
+                {"from": "human", "value": f"What action should the robot take to {lan_prompt}?"},
+                {"from": "gpt", "value": action_chunk_string},
+            ]
+        else:
+            conversation = [
+                {"from": "human", "value": f"No language instruction"},
+                {"from": "gpt", "value": action_chunk_string},
+            ]   
+        
+        # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
+        
         for turn in conversation:
             prompt_builder.add_turn(turn["from"], turn["value"])
 
-        input_ids_list = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
-        input_ids = torch.tensor(input_ids_list, dtype=torch.long)
-        labels = input_ids.clone()
-
-        # Frodobots 방식: action chunk + stop 토큰만 loss 계산
+        # Tokenize (w/ `base_tokenizer`)     
+        input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
+        labels = list(input_ids)
+        input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)    
+        
+        # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!     
         labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
-
-        # ---- Other required fields (numpy) ----
-        # goal_pose / obj_pose_norm은 일부 loss 경로에서 참조됨 -> 0이라도 넣어두기
-        goal_pose_np = np.zeros((4,), dtype=np.float32)
-        obj_pose_norm_np = goal_pose_np[:2].copy().astype(np.float32)
-
-        # temp_dist는 코드에서 clip만 함
-        temp_dist_np = np.array(10.0, dtype=np.float32)
-
-        # action_select_mask: raw action loss 쓰려면 1.0
-        action_select_mask_np = np.array(1.0, dtype=np.float32)
-
-        # modality_id: repo에서 0~8 범위 전제를 깔고 있는 로직이 있어 안전하게 7 고정 추천
-        modality_id = int(self.modality)
-        if modality_id not in (IMAGE_ONLY, LANGUAGE_ONLY, LANGUAGE_AND_POSE):
-            modality_id = LANGUAGE_ONLY
+            
+        # pose 데이터는 마스킹처리
+        goal_pos_cos_sin = np.zeros(4, dtype=np.float32)
+        distance = 0  #거리 정보도 무의미
+        
+        # 물체 포즈 정규화
+        # 원래 로봇팔이 물체를 집을 때 물체의 위치를 알려주기 위함 인데, navigatio에서는 물체가 없으므로 그냥 0으로 채움
+        obj_pose_norm = np.zeros(2, dtype=np.float32)
+        
+        if modality_id == 7: 
+            pixel_values_goal = torch.zeros_like(pixel_values)  # dummy image for language-only case
 
         return dict(
             dataset_name="uon_amr",
-            modality_id=modality_id,  # ✅ int
+            modality_id=modality_id,
 
-            pixel_values=pixel_values,           # ✅ torch
-            pixel_values_goal=pixel_values_goal, # ✅ torch
+            pixel_values=pixel_values,           # 현재 시점의 관측 이미지: DinoV2/SigLIP 입력용
+            pixel_values_goal=pixel_values_goal, # 목표 지점의 이미지 (modality_id = 6일 때 사용)
 
-            input_ids=input_ids,                 # ✅ torch
-            labels=labels,                       # ✅ torch
+            input_ids=input_ids,                 
+            labels=labels,                       
 
-            actions=actions_np,                  # ✅ numpy
-            action_select_mask=action_select_mask_np,
+            actions=torch.as_tensor(actions),                 
+            action_select_mask=action_select_mask,
 
-            goal_pose=goal_pose_np,
-            obj_pose_norm=obj_pose_norm_np,
-            temp_dist=temp_dist_np,
+            goal_pose=goal_pos_cos_sin,
+            obj_pose_norm=obj_pose_norm,
+            temp_dist=distance,
 
-            cur_image=mbra["cur_image"],         # ✅ numpy (3*(ctx+1),96,96)
-            goal_image_8=mbra["goal_image_8"],   # ✅ numpy (3,96,96)
+            cur_image=cur_image_context,   # context/history: 과거 프레임들을 쌓은 데이터
+            goal_image_8=goal_img_tensor,   # Raw Goal Image Tensor
 
-            img_PIL=img_pil,
-            gimg_PIL=gimg_pil,
+            img_PIL=pil_current, # 디버깅/로그용 PIL 이미지
+            gimg_PIL=pil_goal,   # 디버깅/로그용 PIL 이미지 
 
             lan_prompt=lan_prompt,
-        )
+        )          
+        

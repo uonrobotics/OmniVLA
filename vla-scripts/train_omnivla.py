@@ -970,19 +970,11 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
     for split in ["train", "test"]:
         if cfg.dataset_name == "uon_amr":
             ds = UONAMR_Dataset(
-                root=cfg.data_root_dir,
                 action_tokenizer=action_tokenizer,
                 base_tokenizer=processor.tokenizer,
                 image_transform=processor.image_processor.apply_transform,
                 prompt_builder_fn=PurePromptBuilder,
-                modality=7,  #here change modality id           
-                dataset_framerate=15, 
-                action_horizon=8,
-                len_traj_pred=8,
-                context_size=5,
-                context_spacing=1,
-                action_spacing=1,
-                predict_stop_token=True,
+                root=cfg.data_root_dir,
             )
         else:
             ds = Dummy_Dataset(
