@@ -66,7 +66,7 @@ class GotoSim_Dataset(Dataset):
         action_tokenizer,
         prompt_builder_fn,
         base_tokenizer,
-        image_size: Tuple[int, int] = (224, 224),
+        image_size: Tuple[int, int] = (96, 96),
         image_size_clip: Tuple[int, int] = (224, 224),
         metric_waypoint_spacing: float = 0.25,
         action_horizon: int = 8,
@@ -221,9 +221,9 @@ class GotoSim_Dataset(Dataset):
     def _frame_path(self, goal_name: str, episode_id: str, frame_index: int) -> Path:
         """
         Example:
-            root/rgb/goal_marker1/0009/000000.png
+            root/rgb/goal_marker1/0009/0000.png
         """
-        return self.rgb_root / goal_name / str(episode_id) / f"{frame_index:06d}.png"
+        return self.rgb_root / goal_name / str(episode_id) / f"rgb_{frame_index:04d}.png"
 
     def _load_rgb_frame(self, goal_name: str, episode_id: str, frame_index: int) -> np.ndarray:
         path = self._frame_path(goal_name, episode_id, frame_index)
@@ -535,7 +535,8 @@ class GotoSim_Dataset(Dataset):
         sample_id = sample["sample_id"]
 
         # 1) current state/image
-        current_img_np = self._load_rgb_frame(goal_name, episode_id, t)
+        cur_frame_idx = traj[t]["index"]
+        current_img_np = self._load_rgb_frame(goal_name, episode_id, cur_frame_idx)
         current_world = (
             traj[t]["map_pose"]["x"],
             traj[t]["map_pose"]["y"],
@@ -558,8 +559,9 @@ class GotoSim_Dataset(Dataset):
                 g = min(len(traj) - 1, t + 1)
             else:
                 g = random.randint(min_future, max_future)
-
-            goal_img_np = self._load_rgb_frame(goal_name, episode_id, g)
+            
+            goal_frame_idx = traj[g]["index"]
+            goal_img_np = self._load_rgb_frame(goal_name, episode_id, goal_frame_idx)
             goal_world = (
                 traj[g]["map_pose"]["x"],
                 traj[g]["map_pose"]["y"],
@@ -569,8 +571,9 @@ class GotoSim_Dataset(Dataset):
 
         elif goal_source == "destination":
             # use the last frame of the episode as destination image
-            g = len(traj) - 1
-            goal_img_np = self._load_rgb_frame(goal_name, episode_id, g)
+            g = len(traj) - 5 # trajectory는 기록 됐는데, frame은 없을수도 있어서 -5 로 보수적으로 접근
+            goal_frame_idx = traj[g]["index"]
+            goal_img_np = self._load_rgb_frame(goal_name, episode_id, goal_frame_idx)
             goal_world = (
                 final_goal_pose["x"],
                 final_goal_pose["y"],

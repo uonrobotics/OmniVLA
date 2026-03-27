@@ -507,7 +507,7 @@ def build_dataset(args):
         action_tokenizer=_DummyActionTokenizer(),
         prompt_builder_fn=_DummyPromptBuilder,
         base_tokenizer=_DummyBaseTokenizer(),
-        image_size=(224, 224),
+        image_size=(96, 96),
         image_size_clip=(224, 224),
         metric_waypoint_spacing=args.metric_waypoint_spacing,
         action_horizon=args.action_horizon,
