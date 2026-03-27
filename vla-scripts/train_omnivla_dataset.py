@@ -104,12 +104,12 @@ from prismatic.vla.datasets.dummy_dataset import Dummy_Dataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
 #dataset
-from prismatic.vla.datasets.lelan_dataset import LeLaN_Dataset
-from prismatic.vla.datasets.gnm_dataset import GNM_Dataset
-from prismatic.vla.datasets.bdd_dataset import BDD_Dataset
-from prismatic.vla.datasets.cast_dataset import CAST_Dataset
+# from prismatic.vla.datasets.lelan_dataset import LeLaN_Dataset
+# from prismatic.vla.datasets.gnm_dataset import GNM_Dataset
+# from prismatic.vla.datasets.bdd_dataset import BDD_Dataset
+# from prismatic.vla.datasets.cast_dataset import CAST_Dataset
 from prismatic.vla.datasets.goto_sim_dataset import GotoSim_Dataset
-from prismatic.vla.datasets.frodobots_dataset import Frodobots_Dataset, EpisodeSampler_Frodobots
+# from prismatic.vla.datasets.frodobots_dataset import Frodobots_Dataset, EpisodeSampler_Frodobots
 
 from vint_train.models.exaug.exaug import ExAug_dist_delay
 
@@ -1036,233 +1036,233 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
                 batch_size=cfg.batch_size,
                 shuffle=False,
                 collate_fn=collator,
-                num_workers=cfg.num_workers,
+                num_workers=config["num_workers"],
                 drop_last=True,
                 persistent_workers=True,
                 sampler=sampler_train_gotosim,
             )
              
-        #CAST dataset 
-        if data_split_type == "train":
-            cast_loc = config["datasets_CAST"]["path"]
-            print("CAST dataset from ", cast_loc)
-            with open(cast_loc + "features.pkl", 'rb') as f:
-                features, num_examples = pickle.load(f)
+        # #CAST dataset 
+        # if data_split_type == "train":
+        #     cast_loc = config["datasets_CAST"]["path"]
+        #     print("CAST dataset from ", cast_loc)
+        #     with open(cast_loc + "features.pkl", 'rb') as f:
+        #         features, num_examples = pickle.load(f)
                                     
-            CAST_dataset_list = ["cast_filtered_dataset_convert", "cast_counterfactual_dataset_convert", "atomic_turn_right_dataset_convert", "atomic_turn_left_dataset_convert", "atomic_stop_dataset_convert", "atomic_forward_dataset_convert", "atomic_adjust_right_dataset_convert", "atomic_adjust_left_dataset_convert"]
-            CAST_size = [15493, 103125, 27486, 28336, 1293, 94656, 5872, 6706]
-            ratios = [0.4, 0.4, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1] #weighting is same as the original CAST setup
-            weights = []
-            for size, ratio in zip(CAST_size, ratios):
-                weights.extend([ratio / size] * size)
-            weights = torch.DoubleTensor(weights)
+        #     CAST_dataset_list = ["cast_filtered_dataset_convert", "cast_counterfactual_dataset_convert", "atomic_turn_right_dataset_convert", "atomic_turn_left_dataset_convert", "atomic_stop_dataset_convert", "atomic_forward_dataset_convert", "atomic_adjust_right_dataset_convert", "atomic_adjust_left_dataset_convert"]
+        #     CAST_size = [15493, 103125, 27486, 28336, 1293, 94656, 5872, 6706]
+        #     ratios = [0.4, 0.4, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1] #weighting is same as the original CAST setup
+        #     weights = []
+        #     for size, ratio in zip(CAST_size, ratios):
+        #         weights.extend([ratio / size] * size)
+        #     weights = torch.DoubleTensor(weights)
                 
-            train_dataset_CAST_l = []
-            for idx, dataset_name in enumerate(CAST_dataset_list):    
-                train_dataset_CAST_comp = CAST_Dataset(action_tokenizer=action_tokenizer,
-                    base_tokenizer=processor.tokenizer, 
-                    image_transform=processor.image_processor.apply_transform,
-                    prompt_builder_fn=PurePromptBuilder,
-                    dataset_name=dataset_name,
-                    data_loc=cast_loc,
-                    data_size=CAST_size[idx],
-                    features=features)
-                train_dataset_CAST_l.append(train_dataset_CAST_comp)
+        #     train_dataset_CAST_l = []
+        #     for idx, dataset_name in enumerate(CAST_dataset_list):    
+        #         train_dataset_CAST_comp = CAST_Dataset(action_tokenizer=action_tokenizer,
+        #             base_tokenizer=processor.tokenizer, 
+        #             image_transform=processor.image_processor.apply_transform,
+        #             prompt_builder_fn=PurePromptBuilder,
+        #             dataset_name=dataset_name,
+        #             data_loc=cast_loc,
+        #             data_size=CAST_size[idx],
+        #             features=features)
+        #         train_dataset_CAST_l.append(train_dataset_CAST_comp)
                 
-            train_dataset_CAST = ConcatDataset(train_dataset_CAST_l)
+        #     train_dataset_CAST = ConcatDataset(train_dataset_CAST_l)
                 
-            sampler_train_cast = DistributedWeightedSampler(
-                weights, num_samples=len(train_dataset_CAST), replacement=True
-            )
+        #     sampler_train_cast = DistributedWeightedSampler(
+        #         weights, num_samples=len(train_dataset_CAST), replacement=True
+        #     )
  
-            train_loader_CAST = DataLoader(
-                train_dataset_CAST,
-                batch_size=Bcast,
-                shuffle=False,            
-                num_workers=config["num_workers"],
-                collate_fn=collator,
-                drop_last=True,
-                persistent_workers=True,
-                sampler=sampler_train_cast)           
+        #     train_loader_CAST = DataLoader(
+        #         train_dataset_CAST,
+        #         batch_size=Bcast,
+        #         shuffle=False,            
+        #         num_workers=config["num_workers"],
+        #         collate_fn=collator,
+        #         drop_last=True,
+        #         persistent_workers=True,
+        #         sampler=sampler_train_cast)           
 
-        #Frodobots-2k dataset 
-        split_train_test = int(11994*0.9)             
-        if data_split_type == "train":
-            dataset_Frodobots = Frodobots_Dataset(
-                action_tokenizer=action_tokenizer,
-                base_tokenizer=processor.tokenizer, 
-                image_transform=processor.image_processor.apply_transform,
-                prompt_builder_fn=PurePromptBuilder,                 
-                video="video", 
-                root=config["datasets_frodobots"]["root"], 
-                image_size=config["image_size"], 
-                split="train", 
-                goal_horizon=config["datasets_frodobots"]["horizon_short"], 
-                goal_horizon2=config["datasets_frodobots"]["horizon_long"], 
-                context_spacing=3, 
-                action_spacing=3)         
-            sampler_train_frodobots = EpisodeSampler_Frodobots(dataset_Frodobots, 0, split_train_test, goal_horizon=config["datasets_frodobots"]["horizon_short"], data_split_type=data_split_type, num_replicas=world_size, rank=device_id)  
-            train_loader_frodobots = DataLoader(
-                dataset_Frodobots,
-                batch_size=Bfrod,
-                shuffle=False,            
-                num_workers=config["num_workers"],
-                collate_fn=collator,
-                drop_last=True,
-                persistent_workers=True,
-                sampler=sampler_train_frodobots,
-            )                                
+        # #Frodobots-2k dataset 
+        # split_train_test = int(11994*0.9)             
+        # if data_split_type == "train":
+        #     dataset_Frodobots = Frodobots_Dataset(
+        #         action_tokenizer=action_tokenizer,
+        #         base_tokenizer=processor.tokenizer, 
+        #         image_transform=processor.image_processor.apply_transform,
+        #         prompt_builder_fn=PurePromptBuilder,                 
+        #         video="video", 
+        #         root=config["datasets_frodobots"]["root"], 
+        #         image_size=config["image_size"], 
+        #         split="train", 
+        #         goal_horizon=config["datasets_frodobots"]["horizon_short"], 
+        #         goal_horizon2=config["datasets_frodobots"]["horizon_long"], 
+        #         context_spacing=3, 
+        #         action_spacing=3)         
+        #     sampler_train_frodobots = EpisodeSampler_Frodobots(dataset_Frodobots, 0, split_train_test, goal_horizon=config["datasets_frodobots"]["horizon_short"], data_split_type=data_split_type, num_replicas=world_size, rank=device_id)  
+        #     train_loader_frodobots = DataLoader(
+        #         dataset_Frodobots,
+        #         batch_size=Bfrod,
+        #         shuffle=False,            
+        #         num_workers=config["num_workers"],
+        #         collate_fn=collator,
+        #         drop_last=True,
+        #         persistent_workers=True,
+        #         sampler=sampler_train_frodobots,
+        #     )                                
         
-        #GNM dataset   
-        train_dataset_gnm = []
-        test_dataset_gnm = [] 
-        for dataset_name in config["datasets_gnm"]:       
-            if dataset_name in ["distance", "action"]:
-                continue
+        # #GNM dataset   
+        # train_dataset_gnm = []
+        # test_dataset_gnm = [] 
+        # for dataset_name in config["datasets_gnm"]:       
+        #     if dataset_name in ["distance", "action"]:
+        #         continue
                 
-            data_config_sub = config["datasets_gnm"][dataset_name]
-            if "negative_mining" not in data_config_sub:
-                data_config_sub["negative_mining"] = True
-            if "goals_per_obs" not in data_config_sub:
-                data_config_sub["goals_per_obs"] = 1
-            if "end_slack" not in data_config_sub:
-                data_config_sub["end_slack"] = 0
-            if "waypoint_spacing" not in data_config_sub:
-                data_config_sub["waypoint_spacing"] = 1                        
-            if data_split_type in data_config_sub:                   
-                dataset_gnm = GNM_Dataset(
-                    action_tokenizer=action_tokenizer,
-                    base_tokenizer=processor.tokenizer, 
-                    image_transform=processor.image_processor.apply_transform,
-                    prompt_builder_fn=PurePromptBuilder,                        
-                    data_folder=data_config_sub["data_folder"],
-                    data_split_folder=data_config_sub[data_split_type],
-                    dataset_name=dataset_name,
-                    image_size=config["image_size"],
-                    waypoint_spacing=data_config_sub["waypoint_spacing"],
-                    min_dist_cat=config["datasets_gnm"]["distance"]["min_dist_cat"],
-                    max_dist_cat=config["datasets_gnm"]["distance"]["max_dist_cat"],
-                    min_action_distance=config["datasets_gnm"]["action"]["min_dist_cat"],
-                    max_action_distance=config["datasets_gnm"]["action"]["max_dist_cat"],
-                    negative_mining=data_config_sub["negative_mining"],
-                    len_traj_pred=config["len_traj_pred"],
-                    learn_angle=config["learn_angle"],
-                    context_size=config["context_size"],
-                    context_type=config["context_type"],
-                    end_slack=data_config_sub["end_slack"],
-                    goals_per_obs=data_config_sub["goals_per_obs"],
-                    normalize=config["normalize"],
-                )
-            if data_split_type == "train":    
-                train_dataset_gnm.append(dataset_gnm)
+        #     data_config_sub = config["datasets_gnm"][dataset_name]
+        #     if "negative_mining" not in data_config_sub:
+        #         data_config_sub["negative_mining"] = True
+        #     if "goals_per_obs" not in data_config_sub:
+        #         data_config_sub["goals_per_obs"] = 1
+        #     if "end_slack" not in data_config_sub:
+        #         data_config_sub["end_slack"] = 0
+        #     if "waypoint_spacing" not in data_config_sub:
+        #         data_config_sub["waypoint_spacing"] = 1                        
+        #     if data_split_type in data_config_sub:                   
+        #         dataset_gnm = GNM_Dataset(
+        #             action_tokenizer=action_tokenizer,
+        #             base_tokenizer=processor.tokenizer, 
+        #             image_transform=processor.image_processor.apply_transform,
+        #             prompt_builder_fn=PurePromptBuilder,                        
+        #             data_folder=data_config_sub["data_folder"],
+        #             data_split_folder=data_config_sub[data_split_type],
+        #             dataset_name=dataset_name,
+        #             image_size=config["image_size"],
+        #             waypoint_spacing=data_config_sub["waypoint_spacing"],
+        #             min_dist_cat=config["datasets_gnm"]["distance"]["min_dist_cat"],
+        #             max_dist_cat=config["datasets_gnm"]["distance"]["max_dist_cat"],
+        #             min_action_distance=config["datasets_gnm"]["action"]["min_dist_cat"],
+        #             max_action_distance=config["datasets_gnm"]["action"]["max_dist_cat"],
+        #             negative_mining=data_config_sub["negative_mining"],
+        #             len_traj_pred=config["len_traj_pred"],
+        #             learn_angle=config["learn_angle"],
+        #             context_size=config["context_size"],
+        #             context_type=config["context_type"],
+        #             end_slack=data_config_sub["end_slack"],
+        #             goals_per_obs=data_config_sub["goals_per_obs"],
+        #             normalize=config["normalize"],
+        #         )
+        #     if data_split_type == "train":    
+        #         train_dataset_gnm.append(dataset_gnm)
                      
-        if data_split_type == "train":                     
-            train_dataset_gnm = ConcatDataset(train_dataset_gnm)
-            sampler_train_gnm = DistributedSampler(train_dataset_gnm, num_replicas=world_size, rank=device_id, shuffle=True)                    
-            train_loader_gnm = DataLoader(
-                train_dataset_gnm,
-                batch_size=Bgnm,
-                shuffle=False,
-                num_workers=config["num_workers"],
-                collate_fn=collator,
-                drop_last=True,
-                persistent_workers=True,
-                sampler=sampler_train_gnm,
-            )                  
+        # if data_split_type == "train":                     
+        #     train_dataset_gnm = ConcatDataset(train_dataset_gnm)
+        #     sampler_train_gnm = DistributedSampler(train_dataset_gnm, num_replicas=world_size, rank=device_id, shuffle=True)                    
+        #     train_loader_gnm = DataLoader(
+        #         train_dataset_gnm,
+        #         batch_size=Bgnm,
+        #         shuffle=False,
+        #         num_workers=config["num_workers"],
+        #         collate_fn=collator,
+        #         drop_last=True,
+        #         persistent_workers=True,
+        #         sampler=sampler_train_gnm,
+        #     )                  
 
-        #BDD dataset     
-        data_config_bdd = config["datasets_bdd"]
-        dataset_bdd = BDD_Dataset(
-            action_tokenizer=action_tokenizer,
-            base_tokenizer=processor.tokenizer, 
-            image_transform=processor.image_processor.apply_transform,
-            prompt_builder_fn=PurePromptBuilder,              
-            data_split_folder=data_config_bdd[data_split_type],
-            dataset_name="bdd",
-            image_size=config["image_size"],
-            waypoint_spacing=data_config_bdd["waypoint_spacing"],
-            len_traj_pred=config["len_traj_pred"],
-            learn_angle=config["learn_angle"],
-            context_size=config["context_size"],
-            data_split_type = data_split_type,
-            data_folder = data_config_bdd["image"],    
-            pickle_folder = data_config_bdd["pickle"],                                                                        
-            context_type=config["context_type"],
-            normalize=config["normalize"],
-            aug_seq=data_config_bdd["aug_seq"],                                                     
-        )   
-        if data_split_type == "train":
-            sampler_train_bdd = DistributedSampler(dataset_bdd, num_replicas=world_size, rank=device_id, shuffle=True)  
-            train_loader_bdd = DataLoader(
-                dataset_bdd,
-                batch_size=Bbdd,
-                shuffle=False,
-                num_workers=config["num_workers"],
-                collate_fn=collator,
-                drop_last=True,
-                persistent_workers=True,
-                sampler=sampler_train_bdd,
-            )      
+        # #BDD dataset     
+        # data_config_bdd = config["datasets_bdd"]
+        # dataset_bdd = BDD_Dataset(
+        #     action_tokenizer=action_tokenizer,
+        #     base_tokenizer=processor.tokenizer, 
+        #     image_transform=processor.image_processor.apply_transform,
+        #     prompt_builder_fn=PurePromptBuilder,              
+        #     data_split_folder=data_config_bdd[data_split_type],
+        #     dataset_name="bdd",
+        #     image_size=config["image_size"],
+        #     waypoint_spacing=data_config_bdd["waypoint_spacing"],
+        #     len_traj_pred=config["len_traj_pred"],
+        #     learn_angle=config["learn_angle"],
+        #     context_size=config["context_size"],
+        #     data_split_type = data_split_type,
+        #     data_folder = data_config_bdd["image"],    
+        #     pickle_folder = data_config_bdd["pickle"],                                                                        
+        #     context_type=config["context_type"],
+        #     normalize=config["normalize"],
+        #     aug_seq=data_config_bdd["aug_seq"],                                                     
+        # )   
+        # if data_split_type == "train":
+        #     sampler_train_bdd = DistributedSampler(dataset_bdd, num_replicas=world_size, rank=device_id, shuffle=True)  
+        #     train_loader_bdd = DataLoader(
+        #         dataset_bdd,
+        #         batch_size=Bbdd,
+        #         shuffle=False,
+        #         num_workers=config["num_workers"],
+        #         collate_fn=collator,
+        #         drop_last=True,
+        #         persistent_workers=True,
+        #         sampler=sampler_train_bdd,
+        #     )      
         
-        #LeLaN dataset
-        train_dataset_lan = []
-        test_dataset_lan = []                         
-        for dataset_name_lan in config["datasets_lelan"]:
-            data_config_lan = config["datasets_lelan"][dataset_name_lan]   
+        # #LeLaN dataset
+        # train_dataset_lan = []
+        # test_dataset_lan = []                         
+        # for dataset_name_lan in config["datasets_lelan"]:
+        #     data_config_lan = config["datasets_lelan"][dataset_name_lan]   
                                                  
-            dataset_lelan = LeLaN_Dataset(
-                action_tokenizer=action_tokenizer,
-                base_tokenizer=processor.tokenizer, 
-                image_transform=processor.image_processor.apply_transform,
-                prompt_builder_fn=PurePromptBuilder,                  
-                data_split_folder=data_config_lan[data_split_type],
-                dataset_name=dataset_name_lan,
-                image_size=config["image_size"],
-                waypoint_spacing=1,
-                len_traj_pred=config["len_traj_pred"],
-                learn_angle=config["learn_angle"],
-                context_size=config["context_size"],
-                data_split_type = data_split_type,
-                data_image_folder = data_config_lan["image"],
-                data_pickle_folder = data_config_lan["pickle"],                                                                        
-                context_type=config["context_type"],
-                normalize=config["normalize"],
-                backside=data_config_lan["backside"],
-                aug_seq=data_config_lan["aug_seq"],   
-                only_front=data_config_lan["only_front"],                                                                       
-            ) 
-            if data_split_type == "train":
-                train_dataset_lan.append(dataset_lelan)
+        #     dataset_lelan = LeLaN_Dataset(
+        #         action_tokenizer=action_tokenizer,
+        #         base_tokenizer=processor.tokenizer, 
+        #         image_transform=processor.image_processor.apply_transform,
+        #         prompt_builder_fn=PurePromptBuilder,                  
+        #         data_split_folder=data_config_lan[data_split_type],
+        #         dataset_name=dataset_name_lan,
+        #         image_size=config["image_size"],
+        #         waypoint_spacing=1,
+        #         len_traj_pred=config["len_traj_pred"],
+        #         learn_angle=config["learn_angle"],
+        #         context_size=config["context_size"],
+        #         data_split_type = data_split_type,
+        #         data_image_folder = data_config_lan["image"],
+        #         data_pickle_folder = data_config_lan["pickle"],                                                                        
+        #         context_type=config["context_type"],
+        #         normalize=config["normalize"],
+        #         backside=data_config_lan["backside"],
+        #         aug_seq=data_config_lan["aug_seq"],   
+        #         only_front=data_config_lan["only_front"],                                                                       
+        #     ) 
+        #     if data_split_type == "train":
+        #         train_dataset_lan.append(dataset_lelan)
                     
-        if data_split_type == "train":                   
-            train_dataset_lan = ConcatDataset(train_dataset_lan)
+        # if data_split_type == "train":                   
+        #     train_dataset_lan = ConcatDataset(train_dataset_lan)
 
-            if False: #In our original training, we did not weight the dataset. But we noticed that it does help a bit.                
-                dataset_sizes = [len(ds) for ds in train_dataset_lan.datasets]
-                total_size = sum(dataset_sizes)
+        #     if False: #In our original training, we did not weight the dataset. But we noticed that it does help a bit.                
+        #         dataset_sizes = [len(ds) for ds in train_dataset_lan.datasets]
+        #         total_size = sum(dataset_sizes)
 
-                # Weight is inverse of dataset size
-                weights_per_dataset = [1.0 / size for size in dataset_sizes]
-                vis_weights_per_dataset = [w / weights_per_dataset[0] for w in weights_per_dataset]
+        #         # Weight is inverse of dataset size
+        #         weights_per_dataset = [1.0 / size for size in dataset_sizes]
+        #         vis_weights_per_dataset = [w / weights_per_dataset[0] for w in weights_per_dataset]
 
-                sample_weights = []
-                for size, w in zip(dataset_sizes, weights_per_dataset):
-                    sample_weights.extend([w] * size)
-                sample_weights = torch.DoubleTensor(sample_weights)
-                sampler_train_lelan = DistributedWeightedSampler(sample_weights, num_samples=total_size, replacement=True)
-            else:
-                sampler_train_lelan = DistributedSampler(train_dataset_lan, num_replicas=world_size, rank=device_id, shuffle=True) 
+        #         sample_weights = []
+        #         for size, w in zip(dataset_sizes, weights_per_dataset):
+        #             sample_weights.extend([w] * size)
+        #         sample_weights = torch.DoubleTensor(sample_weights)
+        #         sampler_train_lelan = DistributedWeightedSampler(sample_weights, num_samples=total_size, replacement=True)
+        #     else:
+        #         sampler_train_lelan = DistributedSampler(train_dataset_lan, num_replicas=world_size, rank=device_id, shuffle=True) 
                 
-            train_loader_lelan = DataLoader(
-                train_dataset_lan,
-                batch_size=Blan,
-                shuffle=False,
-                collate_fn=collator,
-                num_workers=config["num_workers"],
-                drop_last=True,
-                persistent_workers=True,
-                sampler=sampler_train_lelan,
-            )                      
+        #     train_loader_lelan = DataLoader(
+        #         train_dataset_lan,
+        #         batch_size=Blan,
+        #         shuffle=False,
+        #         collate_fn=collator,
+        #         num_workers=config["num_workers"],
+        #         drop_last=True,
+        #         persistent_workers=True,
+        #         sampler=sampler_train_lelan,
+        #     )                      
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_metrics = {
@@ -1310,8 +1310,8 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
                         batch = next(it)
                     except StopIteration:
                         #You can list your all training datasets, which is same as around line 1228--1231 (Sorry for this manual part.)
-                        iters[i] = iter([train_loader_gnm, train_loader_lelan, train_loader_frodobots, train_loader_bdd, train_loader_CAST][i])                        
-                        #iters[i] = iter([train_loader_gnm, train_loader_lelan][i])
+                        # iters[i] = iter([train_loader_gnm, train_loader_lelan, train_loader_frodobots, train_loader_bdd, train_loader_CAST][i])                        
+                        iters[i] = iter([train_loader_gotosim][i])
                         batch = next(iters[i])
                     batches.append(batch)
                 

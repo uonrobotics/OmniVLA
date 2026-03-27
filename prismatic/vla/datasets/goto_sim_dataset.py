@@ -23,8 +23,8 @@ class GotoSim_Dataset(Dataset):
       rgb/
         <goal_name>/
             <episode_id>/
-                000000.png
-                000001.png
+                0000.png
+                0001.png
                 ...
 
     JSON per-episode
@@ -73,6 +73,7 @@ class GotoSim_Dataset(Dataset):
         action_spacing: int = 5,
         min_future_gap: int = 12, 
         max_future_gap: int = 60,
+        context_frames: int = 5,
         predict_stop_token: bool = False, # TODO: ??
         use_flip_aug: bool = False,
         goal_source_probs: Optional[Dict[str, float]] = None,
@@ -91,6 +92,7 @@ class GotoSim_Dataset(Dataset):
         self.action_spacing = action_spacing
         self.min_future_gap = min_future_gap
         self.max_future_gap = max_future_gap
+        self.context_frames = context_frames
         self.predict_stop_token = predict_stop_token
         self.use_flip_aug = use_flip_aug
         
@@ -522,8 +524,6 @@ class GotoSim_Dataset(Dataset):
     # Main sample creation
     # ---------------------------------------------------------------------
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # TODO: context size 가 없네 ???        
-        
         sample = self.samples[idx]
 
         episode_id = sample["episode_id"]
@@ -534,7 +534,7 @@ class GotoSim_Dataset(Dataset):
         final_goal_pose = sample["goal_pose"]
         sample_id = sample["sample_id"]
 
-        # 1) current state/image
+        # 1) history frames + current state/image 
         cur_frame_idx = traj[t]["index"]
         current_img_np = self._load_rgb_frame(goal_name, episode_id, cur_frame_idx)
         current_world = (
@@ -542,6 +542,15 @@ class GotoSim_Dataset(Dataset):
             traj[t]["map_pose"]["y"],
             traj[t]["map_pose"]["yaw"],
         )
+        
+        history_frames: List[torch.Tensor] = []
+        for k in range(self.context_frames, -1, -1):
+            frame_idx = max(0, cur_frame_idx - k)
+            img_np = self._load_rgb_frame(goal_name, episode_id, frame_idx)
+            img_t = torch.from_numpy(img_np).permute(2, 0, 1)
+            img_t = self._resize_norm(img_t, self.image_size)
+            history_frames.append(img_t)
+        cur_image = torch.cat(history_frames, dim=0)  # [C*(context_frames+1), H, W]
 
         # 2) choose goal image / goal pose source
         sample_case = self._sample_training_case()
@@ -613,10 +622,6 @@ class GotoSim_Dataset(Dataset):
         pixel_values = self.image_transform(pil_img)
         pixel_values_goal = self.image_transform(pil_goal)
 
-        cur_image = self._resize_norm(
-            torch.from_numpy(current_img_np).permute(2, 0, 1),
-            self.image_size,
-        )
         goal_image_8 = self._resize_norm(
             torch.from_numpy(goal_img_np).permute(2, 0, 1),
             self.image_size,
