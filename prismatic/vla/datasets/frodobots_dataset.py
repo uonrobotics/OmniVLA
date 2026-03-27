@@ -442,6 +442,46 @@ class Frodobots_Dataset(LeRobotDataset):
             raise ValueError("img_tensor must be (C,H,W) or (T,C,H,W)")
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """
+        Frodobot Dataset (Real-world GPS Navigation)
+
+        목적
+        - 실제 야외 환경에서 수집된 로봇 주행 데이터를 이용해
+        goal pose 기반 navigation 정책을 학습하기 위한 데이터셋.
+
+        데이터 구성
+        - input:
+            current image (현재 카메라 이미지)
+            goal image (미래 프레임)
+            goal pose (GPS/odometry로 계산된 목표의 상대 위치)
+
+        - label:
+            navigation actions (trajectory / control commands)
+
+        주요 특징
+        1. 실제 로봇 주행 데이터
+        - 도시/야외 환경에서 수집된 real-world navigation trajectory.
+
+        2. GPS 기반 위치 정보
+        - 위도/경도 + heading 정보를 이용해
+            현재 위치 → 목표 위치의 relative pose 계산.
+
+        3. goal image + goal pose navigation
+        - 미래 프레임을 goal image로 사용하고
+        - 동시에 목표의 상대 위치(goal pose)도 제공.
+
+        4. imitation learning 데이터
+        - 실제 로봇이 이동한 trajectory를 action label로 사용.
+
+        5. language 없음
+        - semantic instruction 없이
+            visual + pose 기반 navigation 학습.
+
+        한줄 정리
+        - GPS 기반 실제 로봇 주행 trajectory에서
+        (current image, goal image, goal pose) → action을 학습하는
+        real-world navigation 데이터셋.
+        """
         # sample distances and compute delta timestamps
         ep_id = self.dataset_cache["episode_index"][idx].item()
         episode_length_remaining = self.episode_data_index["to"][ep_id] - idx

@@ -299,6 +299,44 @@ class LeLaN_Dataset(Dataset):
         return len(self.image_path)
 
     def __getitem__(self, i: int) -> Tuple[torch.Tensor]:
+        """
+        LeLaN Dataset (Language-conditioned Navigation)
+
+        목적
+        - 로봇이 자연어 instruction을 따라 navigation 하도록 학습하기 위한 데이터셋.
+
+        데이터 구성
+        - input:
+            current image
+            language instruction (예: "move toward the chair")
+            goal pose (instruction 대상 object의 상대 위치)
+
+        - label:
+            navigation trajectory (actions)
+
+        주요 특징
+        1. language 기반 navigation
+        - 목표를 goal image가 아니라 자연어 instruction으로 표현.
+
+        2. object-centered goal
+        - instruction은 보통 scene의 object를 목표로 함
+            (chair, door, trash can 등).
+
+        3. 자동 language 생성
+        - VLM을 이용해 scene object → navigation instruction 생성.
+
+        4. synthetic trajectory 사용
+        - NoMaD 같은 navigation 모델로
+            instruction을 만족하는 trajectory를 생성.
+
+        5. multi-modal navigation 학습 가능
+        - image + language + goal pose 조건으로 navigation 정책 학습.
+
+        한줄 정리
+        - scene object를 목표로 하는 language instruction을 만들고,
+        그 instruction을 따라 이동하는 trajectory를 생성해 만든
+        language-conditioned navigation 데이터셋.
+        """
         flag_data = 0
         iv = i
 

@@ -194,6 +194,47 @@ class BDD_Dataset(Dataset):
         return len(self.image_path)
 
     def __getitem__(self, i: int) -> Tuple[torch.Tensor]:
+        """
+        BDD Dataset (GPS-based Driving Navigation)
+
+        목적
+        - 실제 자율주행 데이터(BDD)를 이용해
+        목표 위치(goal pose)로 이동하는 navigation 정책을 학습하기 위한 데이터셋.
+
+        데이터 구성
+        - input:
+            current image (현재 차량 카메라 이미지)
+            goal image (미래 프레임)
+            goal pose (GPS로 계산된 목표의 상대 위치)
+
+        - label:
+            navigation trajectory (action sequence)
+
+        주요 특징
+        1. 실제 자율주행 데이터
+        - BDD driving dataset 기반의 real-world 주행 영상 사용.
+
+        2. GPS 기반 goal pose
+        - 위도/경도(GPS)와 heading 정보를 이용해
+            현재 위치 → 목표 위치의 relative pose 계산.
+
+        3. goal image + goal pose navigation
+        - 미래 프레임을 goal image로 사용하고
+            동시에 목표의 상대 위치(goal pose)를 제공.
+
+        4. synthetic action 사용
+        - 실제 차량 action 대신
+            MBRA 모델로 생성된 trajectory를 action label로 사용.
+
+        5. language 없음
+        - semantic instruction 없이
+            visual + pose 기반 navigation 학습.
+
+        한줄 정리
+        - BDD 자율주행 영상에서
+        (current image, goal image, GPS-based goal pose) → action을 학습하는
+        real-world driving navigation 데이터셋.
+        """
         flag_data = 0
         iv = i
         

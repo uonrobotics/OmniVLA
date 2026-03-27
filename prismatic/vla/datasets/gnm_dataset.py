@@ -271,6 +271,45 @@ class GNM_Dataset(Dataset):
     def __len__(self) -> int:
         return len(self.index_to_data)
     def __getitem__(self, i: int) -> Tuple[torch.Tensor]:
+        """
+        GNM Dataset (General Navigation Model)
+
+        목적
+        - 로봇이 현재 카메라 이미지에서 목표 이미지까지 이동하는 navigation 정책을 학습하기 위한 데이터셋.
+
+        핵심 아이디어
+        - 목표(goal)를 사람이 라벨링하지 않고,
+        같은 trajectory의 "미래 프레임"을 goal image로 사용한다.
+
+        데이터 구성
+        - input:
+            current image (현재 카메라 이미지)
+            goal image    (같은 trajectory의 미래 프레임)
+            goal pose     (trajectory로부터 계산된 상대 위치)
+
+        - label:
+            current → goal로 이동하는 action trajectory
+
+        주요 특징
+        1. 자동 데이터 생성 (self-supervised)
+        - goal을 미래 프레임으로 사용하므로 annotation이 필요 없음.
+
+        2. 데이터 확장성이 매우 큼
+        - 하나의 trajectory에서 많은 (current, goal) pair 생성 가능.
+
+        3. visual goal navigation
+        - 모델은 "목표 이미지 방향으로 이동하는 방법"을 학습.
+
+        4. local navigation 정책
+        - 장애물 회피 및 goal 방향 이동 같은 short-horizon navigation 학습.
+
+        5. language / semantic goal 없음
+        - object나 instruction이 아니라 단순히 "목표 이미지" 기반 navigation.
+
+        한줄 정리
+        - 로봇 주행 trajectory에서 (현재 이미지, 미래 이미지) 쌍을 만들어
+        goal image까지 이동하는 navigation policy를 학습하는 데이터셋.
+        """
         f_curr, curr_time, max_goal_dist = self.index_to_data[i]
         f_goal, goal_time, goal_is_negative = self._sample_goal(f_curr, curr_time, max_goal_dist)
 

@@ -63,6 +63,46 @@ class CAST_Dataset(Dataset):
         return torch.from_numpy(actions), torch.from_numpy(goal_pos)
 
     def __getitem__(self, idx):
+        """
+        CAST Dataset (Language + Pose Navigation)
+
+        목적
+        - 로봇이 자연어 instruction을 따라 목표 위치로 이동하는
+        language-conditioned navigation 정책을 학습하기 위한 데이터셋.
+
+        데이터 구성
+        - input:
+            current image (현재 카메라 이미지)
+            language instruction (예: "go to the kitchen")
+            goal pose (목표 위치의 상대 좌표)
+
+        - label:
+            navigation trajectory (action sequence)
+
+        주요 특징
+        1. language 기반 navigation
+        - 목표를 자연어 instruction으로 제공.
+
+        2. goal pose 제공
+        - 로봇 상태(state)로부터 목표 위치를 계산해
+            relative pose 형태로 제공.
+
+        3. 실제 trajectory 기반 imitation learning
+        - 로봇이 실제 이동한 trajectory를 action label로 사용.
+
+        4. action sequence 학습
+        - 단일 action이 아니라
+            여러 step의 trajectory (future actions)를 예측.
+
+        5. multimodal navigation 데이터
+        - image + language + goal pose 조건으로
+            navigation 정책을 학습.
+
+        한줄 정리
+        - 현재 이미지와 language instruction을 입력으로 받아
+        목표 위치까지 이동하는 trajectory를 예측하도록 만든
+        language-conditioned navigation 데이터셋.
+        """
         folder_name = self.dataset_name.split("_convert")
         directory_location = self.data_loc + self.dataset_name + "/" + folder_name[0] + "/"
         

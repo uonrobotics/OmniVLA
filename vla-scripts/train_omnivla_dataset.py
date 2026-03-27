@@ -1,5 +1,5 @@
 """
-train_omnivla.py
+train_omnivla_dataset.py
 
 Train or finetune OmniVLA with LoRA.
 """
@@ -108,6 +108,7 @@ from prismatic.vla.datasets.lelan_dataset import LeLaN_Dataset
 from prismatic.vla.datasets.gnm_dataset import GNM_Dataset
 from prismatic.vla.datasets.bdd_dataset import BDD_Dataset
 from prismatic.vla.datasets.cast_dataset import CAST_Dataset
+from prismatic.vla.datasets.goto_sim_dataset import GotoSim_Dataset
 from prismatic.vla.datasets.frodobots_dataset import Frodobots_Dataset, EpisodeSampler_Frodobots
 
 from vint_train.models.exaug.exaug import ExAug_dist_delay
@@ -1008,7 +1009,39 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
 
     #Batch size (You can edit according to your GPU resources.)
     Bcast, Bfrod, Bgnm, Bbdd, Blan = cfg.batch_size, cfg.batch_size, cfg.batch_size, cfg.batch_size, cfg.batch_size    
-    for data_split_type in ["train"]:          
+    for data_split_type in ["train"]:     
+        #Goto sim dataset
+        if data_split_type == "train":
+            dataset_gotosim = GotoSim_Dataset(
+                root_dir="/nas/sujinkim/data/goto/sim/20260323/",
+                image_transform=processor.image_processor.apply_transform,
+                action_tokenizer=action_tokenizer,
+                prompt_builder_fn=PurePromptBuilder,
+                base_tokenizer=processor.tokenizer
+            )
+            
+            train_dataset_gotosim = []
+            train_dataset_gotosim.append(dataset_gotosim)
+            train_dataset_gotosim = ConcatDataset(train_dataset_gotosim)
+            
+            sampler_train_gotosim = DistributedSampler(
+                train_dataset_gotosim,
+                num_replicas=world_size,
+                rank=device_id,
+                shuffle=True,
+            )
+            
+            train_loader_gotosim = DataLoader(
+                train_dataset_gotosim,
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                collate_fn=collator,
+                num_workers=cfg.num_workers,
+                drop_last=True,
+                persistent_workers=True,
+                sampler=sampler_train_gotosim,
+            )
+             
         #CAST dataset 
         if data_split_type == "train":
             cast_loc = config["datasets_CAST"]["path"]
@@ -1249,10 +1282,10 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
     }
 
     #You can list all your training datasets. Following with 5 datasets does not work on Nvidia 4090, due to the memory limitation. You need to reduce the number of the data loader.    
-    iters = [iter(train_loader_gnm), iter(train_loader_lelan), iter(train_loader_frodobots), iter(train_loader_bdd), iter(train_loader_CAST)]
-    samplers = [sampler_train_gnm, sampler_train_lelan, sampler_train_frodobots, sampler_train_bdd, sampler_train_cast]          
-    #iters = [iter(train_loader_gnm), iter(train_loader_lelan)]
-    #samplers = [sampler_train_gnm, sampler_train_lelan]   
+    # iters = [iter(train_loader_gnm), iter(train_loader_lelan), iter(train_loader_frodobots), iter(train_loader_bdd), iter(train_loader_CAST)]
+    # samplers = [sampler_train_gnm, sampler_train_lelan, sampler_train_frodobots, sampler_train_bdd, sampler_train_cast]          
+    iters = [iter(train_loader_gotosim)]
+    samplers = [sampler_train_gotosim]
                                  
     log_count = 0
     for epoch in range(100):
