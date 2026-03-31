@@ -25,6 +25,7 @@ sys.path.extend([
 # Standard Libraries
 # ==============================
 import os
+import re
 import time
 import math
 import json
@@ -230,6 +231,9 @@ class OmniVLAConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
+    
+    # Inference seed
+    inference_seed: Optional[int] = None             # Random seed for inference (for reproducibility of visualizations)
 
 def remove_ddp_in_checkpoint(state_dict) -> dict:
     new_state_dict = {}
@@ -778,6 +782,21 @@ def merge_batches_padding(batch_list, pad_token_id, IGNORE_INDEX, model_max_leng
     merged["goal_mask_select"] = torch.tensor(merged["modality_id"])
     return merged
 
+
+# Policy inference 비교 위해서 seed 고정
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # torch.use_deterministic_algorithms(True)
+
+
 @draccus.wrap()
 def train_omnivla(cfg: OmniVLAConfig) -> None:
     """
@@ -794,10 +813,14 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
     Returns:
         None.
     """
+    if cfg.inference_seed is not None:
+        set_seed(cfg.inference_seed)
+    
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
+    chkpt_match = re.search(r"--(\d+)_chkpt", cfg.vla_path)
 
     if cfg.vla_path == "openvla/openvla-7b": #from OpenVLA checkpoints
         cfg.resume = False
@@ -811,6 +834,11 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
     elif cfg.vla_path == "./omnivla-finetuned-cast": #from OmniVLA checkpoints fituned with CAST dataset 
         cfg.resume = True      
         cfg.resume_step = 210000 
+
+    if chkpt_match:
+        cfg.resume = True
+        cfg.resume_step = int(chkpt_match.group(1))
+        print(f"Resume: {cfg.resume}, Resume Step: {cfg.resume_step}")
                                                                                           
     # Get experiment run ID
     run_id = get_run_id(cfg)
@@ -1013,11 +1041,11 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
         #Goto sim dataset
         if data_split_type == "train":
             dataset_gotosim = GotoSim_Dataset(
-                root_dir="/nas/sujinkim/data/goto/sim/20260323/",
+                root_dir=cfg.data_root_dir,
                 image_transform=processor.image_processor.apply_transform,
                 action_tokenizer=action_tokenizer,
                 prompt_builder_fn=PurePromptBuilder,
-                base_tokenizer=processor.tokenizer
+                base_tokenizer=processor.tokenizer,
             )
             
             train_dataset_gotosim = []
@@ -1029,7 +1057,12 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
                 num_replicas=world_size,
                 rank=device_id,
                 shuffle=True,
+                seed=cfg.inference_seed if cfg.inference_seed is not None else 0,
             )
+            
+            if cfg.inference_seed is not None:
+                g = torch.Generator()
+                g.manual_seed(cfg.inference_seed)
             
             train_loader_gotosim = DataLoader(
                 train_dataset_gotosim,
@@ -1040,6 +1073,7 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
                 drop_last=True,
                 persistent_workers=True,
                 sampler=sampler_train_gotosim,
+                generator=g if cfg.inference_seed is not None else None,
             )
              
         # #CAST dataset 
