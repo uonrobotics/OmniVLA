@@ -115,7 +115,7 @@ class GotoSim_Dataset(Dataset):
             allowed_goal_sources = {
                 "pose_only": ("future", "destination"),
                 "image_pose": ("future", "destination"),
-                "image_only": ("future", "destination"),
+                "image_only": ("future",),
                 "language_only": ("destination",),
                 "language_pose": ("destination",),
             }
@@ -228,9 +228,17 @@ class GotoSim_Dataset(Dataset):
         return self.rgb_root / goal_name / str(episode_id) / f"rgb_{frame_index:04d}.png"
 
     def _load_rgb_frame(self, goal_name: str, episode_id: str, frame_index: int) -> np.ndarray:
-        path = self._frame_path(goal_name, episode_id, frame_index)
-        img = Image.open(path).convert("RGB")
-        return np.asarray(img, dtype=np.uint8)
+        while frame_index >= 0:
+            path = self._frame_path(goal_name, episode_id, frame_index)
+            try:
+                img = Image.open(path).convert("RGB")
+                return np.asarray(img, dtype=np.uint8)
+            except (FileNotFoundError, OSError):
+                frame_index -= 1
+
+        raise FileNotFoundError(
+            f"No valid frame found for goal={goal_name}, episode={episode_id}"
+        )
 
     # ---------------------------------------------------------------------
     # Geometry helpers
@@ -395,14 +403,13 @@ class GotoSim_Dataset(Dataset):
     def _sample_training_case(self) -> Dict[str, Any]:
         """
         Possible sampling outcomes:
-            - destination pose                         -> modality 4 
-            - future pose                              -> modality 4 
+            - future pose                              -> modality 4  
+            - destination pose                         -> modality 4
             
             - future image + future pose               -> modality 5
             - destination image + destination pose     -> modality 5
             
             - future image                             -> modality 6
-            - destination image                        -> modality 6
             
             - language                                 -> modality 7
             
@@ -576,11 +583,10 @@ class GotoSim_Dataset(Dataset):
                 traj[g]["map_pose"]["y"],
                 traj[g]["map_pose"]["yaw"],
             )
-            goal_image_type = "future_frame"
 
         elif goal_source == "destination":
             # use the last frame of the episode as destination image
-            g = len(traj) - 5 # trajectory는 기록 됐는데, frame은 없을수도 있어서 -5 로 보수적으로 접근
+            g = len(traj) - 1
             goal_frame_idx = traj[g]["index"]
             goal_img_np = self._load_rgb_frame(goal_name, episode_id, goal_frame_idx)
             goal_world = (
@@ -588,7 +594,6 @@ class GotoSim_Dataset(Dataset):
                 final_goal_pose["y"],
                 final_goal_pose["yaw"],
             )
-            goal_image_type = "destination"
 
         else:
             raise ValueError(f"Unsupported goal_source: {goal_source}")
@@ -630,11 +635,40 @@ class GotoSim_Dataset(Dataset):
         # 6) mask out unused modalities
         if not lan_prompt:
             language_instruction = "No language instruction"
-            
-        if not pose_goal:
+
+        modality_scalar = int(modality_id.item())
+
+        # goal_pose is only used as model conditioning input
+        # obj_pose_norm is only used for L2_obj-style auxiliary supervision
+        if modality_scalar in [7, 8]:
+            # Clamp language-conditioned object pose to 2.0m
+            obj_clamp_m = 2.0
+            obj_clamp_norm = obj_clamp_m / self.metric_waypoint_spacing
+
+            obj_norm_dist = np.linalg.norm(obj_pose_norm)
+            if obj_norm_dist > obj_clamp_norm:
+                obj_pose_norm = obj_pose_norm / (obj_norm_dist + 1e-6) * obj_clamp_norm
+
+            # also align goal_pose with the clamped relative object pose
+            goal_pose_cos_sin[0:2] = obj_pose_norm
+
+            if modality_scalar == 7:
+                # language only: no pose input
+                goal_pose_cos_sin = np.zeros(4, dtype=np.float32)
+                # but keep obj_pose_norm for L2_obj
+            else:
+                # modality 8: keep pose input
+                pass
+
+        elif modality_scalar in [4, 5]:
+            # pose-conditioned modalities: keep pose input, mask obj target
+            obj_pose_norm = np.zeros(2, dtype=np.float32)
+
+        elif modality_scalar == 6:
+            # image only: no pose input, no obj target
             goal_pose_cos_sin = np.zeros(4, dtype=np.float32)
             obj_pose_norm = np.zeros(2, dtype=np.float32)
-            
+
         if not image_goal:
             pil_goal = pil_img
             pixel_values_goal = torch.zeros_like(pixel_values_goal)
@@ -651,9 +685,11 @@ class GotoSim_Dataset(Dataset):
                 pil_goal = pil_goal.transpose(Image.FLIP_LEFT_RIGHT)
                 pixel_values_goal = self.image_transform(pil_goal)
 
-            if pose_goal:
+            if modality_scalar in [4, 5, 8]:
                 goal_pose_cos_sin[1] = -goal_pose_cos_sin[1]
                 goal_pose_cos_sin[3] = -goal_pose_cos_sin[3]
+
+            if modality_scalar in [7, 8]:
                 obj_pose_norm[1] = -obj_pose_norm[1]
 
             # action labels are waypoint-style [x, y, cos(yaw), sin(yaw)] chunks
@@ -682,5 +718,4 @@ class GotoSim_Dataset(Dataset):
             temp_dist=goal_distance,
             lan_prompt=language_instruction,
             sample_id=sample_id,
-            goal_image_type=goal_image_type,
         )

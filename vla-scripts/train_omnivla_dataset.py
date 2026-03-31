@@ -484,37 +484,69 @@ def run_forward_pass(
         action_ref = mask_act*ground_truth_actions + mask_notact*action_mbra.detach().to(torch.bfloat16)
 
         limited_temp_dist = torch.clip(batch["temp_dist"], min=0.0, max=20.0) 
-        lan_bool = (batch["goal_mask_select"] == 7)|(batch["goal_mask_select"] == 8) #object loss is only for the LeLaN dataset
-        loss = 1.0*torch.nn.MSELoss()(action_ref, predicted_actions) + 0.1*torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:,-1,0:2][lan_bool]) + 0.1*torch.nn.MSELoss()(predicted_actions[:,0:-1], predicted_actions[:,1:])            
+        lan_bool = (batch["goal_mask_select"] == 7)|(batch["goal_mask_select"] == 8) #object loss is only for the language conditioned dataset
+
         L2_action = torch.nn.MSELoss()(action_ref, predicted_actions)
-        L2_obj = torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:,-1,0:2][lan_bool])
-        L2_smooth = torch.nn.MSELoss()(predicted_actions[:,0:-1], predicted_actions[:,1:])
-            
+        L2_smooth = torch.nn.MSELoss()(predicted_actions[:, 0:-1], predicted_actions[:, 1:])
+        
+        if lan_bool.any():
+            L2_obj = torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:, -1, 0:2][lan_bool])
+            L2_obj_metric = L2_obj
+        else:
+            L2_obj = torch.zeros((), device=device_id, dtype=predicted_actions.dtype) # NaN 방지
+            L2_obj_metric = torch.tensor(float("nan"), device=device_id) # 기록은 NaN으로 남겨서 object loss가 없는 데이터셋임을 명확히 표시
+
+        loss = 1.0 * L2_action + 0.1 * L2_obj + 0.1 * L2_smooth
+
         loss_list = []
         task_list = []
         for icl in range(9):
             mask_task = batch["goal_mask_select"] == icl
-            L2_action_task = torch.nn.MSELoss()(action_ref[mask_task], predicted_actions[mask_task])
+            # NaN 값이 나올 수 있지만, training loss 가 아닌 logging 용 이므로 상관 없음
+            L2_action_task = torch.nn.MSELoss()(action_ref[mask_task], predicted_actions[mask_task]) 
             loss_list.append(L2_action_task)
             task_list.append(torch.sum(mask_task.float()))
+        
+        # action magnitude
+        pred_xy = predicted_actions[:, :, 0:2]
+        pred_action_mag = torch.norm(pred_xy, dim=-1).mean()
+        gt_xy = ground_truth_actions[:, :, 0:2]
+        gt_action_mag = torch.norm(gt_xy, dim=-1).mean()
+        mag_ratio = pred_action_mag / (gt_action_mag + 1e-6)
+        
+        # yaw magnitude (using cos/sim representation -> unit direction similarity)        
+        pred_yaw_vec = predicted_actions[:, :, 2:4]     # [B, H, 2]
+        pred_yaw_mag = torch.norm(pred_yaw_vec, dim=-1).mean()
+        gt_yaw_vec = ground_truth_actions[:, :, 2:4]    # [B, H, 2]
+        gt_yaw_mag = torch.norm(gt_yaw_vec, dim=-1).mean()
+        yaw_mag_ratio = pred_yaw_mag / (gt_yaw_mag + 1e-6)
 
         metrics.update(
             {
                 "loss_value": loss.item(),            # Detached value for logging
                 "L2_action_value": L2_action.item(),  # Detached value for logging                
-                "L2_obj_value": L2_obj.item(),        # Detached value for logging
+                "L2_obj_value": L2_obj_metric.item(), # Detached value for logging
                 "L2_smooth_value": L2_smooth.item(),  # Detached value for logging                  
-                "L2_sate": loss_list[0].item(),
-                "L2_sate_pose": loss_list[1].item(),
-                "L2_sate_img": loss_list[2].item(),  
-                "L2_sate_pose_img": loss_list[3].item(),                                                                           
+                # "L2_sate": loss_list[0].item(),
+                # "L2_sate_pose": loss_list[1].item(),
+                # "L2_sate_img": loss_list[2].item(),  
+                # "L2_sate_pose_img": loss_list[3].item(),                                                                           
                 "L2_pose": loss_list[4].item(),
                 "L2_pose_img": loss_list[5].item(),
                 "L2_img": loss_list[6].item(),  
                 "L2_lan": loss_list[7].item(),         
-                "L2_lan_pose": loss_list[8].item(),                                
+                "L2_lan_pose": loss_list[8].item(),    
+                
+                "GT_action_mag": gt_action_mag.item(),
+                "Pred_action_mag": pred_action_mag.item(),
+                "Action_mag_ratio": mag_ratio.item(),                       
+                     
+                "GT_yaw_mag": gt_yaw_mag.item(),
+                "Pred_yaw_mag": pred_yaw_mag.item(),
+                "Yaw_mag_ratio": yaw_mag_ratio.item(),
             }
         )
+
 
         if VISUALIZE == True:
             visualize_train(
@@ -1304,15 +1336,23 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
         "L2_action_value": deque(maxlen=cfg.grad_accumulation_steps),        
         "L2_obj_value": deque(maxlen=cfg.grad_accumulation_steps),
         "L2_smooth_value": deque(maxlen=cfg.grad_accumulation_steps),             
-        "L2_sate": deque(maxlen=cfg.grad_accumulation_steps),
-        "L2_sate_pose": deque(maxlen=cfg.grad_accumulation_steps),        
-        "L2_sate_img": deque(maxlen=cfg.grad_accumulation_steps),
-        "L2_sate_pose_img": deque(maxlen=cfg.grad_accumulation_steps),   
+        # "L2_sate": deque(maxlen=cfg.grad_accumulation_steps),
+        # "L2_sate_pose": deque(maxlen=cfg.grad_accumulation_steps),        
+        # "L2_sate_img": deque(maxlen=cfg.grad_accumulation_steps),
+        # "L2_sate_pose_img": deque(maxlen=cfg.grad_accumulation_steps),   
         "L2_pose": deque(maxlen=cfg.grad_accumulation_steps),        
         "L2_pose_img": deque(maxlen=cfg.grad_accumulation_steps),
         "L2_img": deque(maxlen=cfg.grad_accumulation_steps),       
         "L2_lan": deque(maxlen=cfg.grad_accumulation_steps),          
-        "L2_lan_pose": deque(maxlen=cfg.grad_accumulation_steps),                                            
+        "L2_lan_pose": deque(maxlen=cfg.grad_accumulation_steps),        
+        
+        "GT_action_mag": deque(maxlen=cfg.grad_accumulation_steps),
+        "Pred_action_mag": deque(maxlen=cfg.grad_accumulation_steps),
+        "Action_mag_ratio": deque(maxlen=cfg.grad_accumulation_steps),  
+        
+        "GT_yaw_mag": deque(maxlen=cfg.grad_accumulation_steps),
+        "Pred_yaw_mag": deque(maxlen=cfg.grad_accumulation_steps),
+        "Yaw_mag_ratio": deque(maxlen=cfg.grad_accumulation_steps),                   
     }
 
     #You can list all your training datasets. Following with 5 datasets does not work on Nvidia 4090, due to the memory limitation. You need to reduce the number of the data loader.    
