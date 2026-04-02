@@ -14,6 +14,8 @@ import math
 import os
 import socket
 import time
+import sys
+import select
 from typing import Optional, Tuple, Type
 
 import numpy as np
@@ -58,10 +60,10 @@ from prismatic.vla.constants import (
 goal_poses = {
     "forklift": (-2.71, -2.45143, 2.45),
     "marker1": (-20.11, 7.0, 1.57),
-    "marker2": (-15.36, -7.0, 1.57),
-    "marker3": (-10.47, -7.0, 1.57),
-    "marker4": (-5.47, -7.0, 1.57),
-    "marker5": (-0.6, -7.0, 1.57),
+    "marker2": (-15.36, 7.0, 1.57),
+    "marker3": (-10.47, 7.0, 1.57),
+    "marker4": (-5.47, 7.0, 1.57),
+    "marker5": (-0.6, 7.0, 1.57),
     "pallet": (0.54, -13.29, 0.31),
 }
 
@@ -188,7 +190,7 @@ def init_module(
 
 class InferenceConfig:
     resume: bool = True
-    vla_path: str = "/home/sujin/workspace/physical-ai/model/goto/sim/20260323_224/run#2/omnivla-original-balance--350000_chkpt/"
+    vla_path: str = "/nas/sujinkim/model/goto/sim/20260323_224/run#2/omnivla-original-balance--350000_chkpt/"
     resume_step: Optional[int] = 350000
     use_l1_regression: bool = True
     use_diffusion: bool = False
@@ -278,8 +280,11 @@ class OmniVLAClient:
         self.metric_waypoint_spacing = WAYPOINT_SPACING
         self.tick_rate = 3
         self.count_id = 0
-        self.datastore_path_image = save_dir
-        os.makedirs(save_dir, exist_ok=True)
+
+        self.base_save_dir = save_dir
+        os.makedirs(self.base_save_dir, exist_ok=True)
+
+        self.datastore_path_image = None
 
         cfg = InferenceConfig()
         (
@@ -295,6 +300,23 @@ class OmniVLAClient:
         self.vla = self.vla.eval()
         self.action_head = self.action_head.eval()
         self.pose_projector = self.pose_projector.eval()
+
+    def get_next_episode_index(self) -> int:
+        existing = []
+        for name in os.listdir(self.base_save_dir):
+            full_path = os.path.join(self.base_save_dir, name)
+            if os.path.isdir(full_path) and name.isdigit():
+                existing.append(int(name))
+
+        if not existing:
+            return 0
+        return max(existing) + 1
+
+    def set_episode_save_dir(self, episode_idx: int):
+        self.datastore_path_image = os.path.join(self.base_save_dir, f"{episode_idx:03d}")
+        os.makedirs(self.datastore_path_image, exist_ok=True)
+        self.count_id = 0
+        print(f"[SAVE DIR] {self.datastore_path_image}")
 
     @staticmethod
     def _wrap_angle(theta: float) -> float:
@@ -529,6 +551,89 @@ class OmniVLAClient:
     # ===========================================================
     # Policy
     # ===========================================================
+    def compute_cmd_vel_from_waypoint(self, dx: float, dy: float, hx: float, hy: float):
+        DT = 1.0 / self.tick_rate
+        EPS = 1e-8
+
+        # -----------------------------
+        # Tunable controller params
+        # -----------------------------
+        POS_DEADBAND = 0.03          # m
+        YAW_DEADBAND = 0.10          # rad
+        SLOW_RADIUS = 0.25           # m
+
+        KP_LIN = 1.2
+        KP_ANG = 1.5
+
+        MAXV = 0.8
+        MAXW = 0.7
+
+        def clip_angle(theta: float) -> float:
+            return math.atan2(math.sin(theta), math.cos(theta))
+
+        # predicted waypoint heading
+        heading_error = clip_angle(np.arctan2(hy, hx))
+
+        # waypoint position error
+        dist = float(np.hypot(dx, dy))
+        path_angle = float(np.arctan2(dy, dx)) if dist > EPS else 0.0
+
+        # -----------------------------
+        # Near-goal behavior
+        # -----------------------------
+        if dist < POS_DEADBAND:
+            if abs(heading_error) < YAW_DEADBAND:
+                linear_vel_value_limit = 0.0
+                angular_vel_value_limit = 0.0
+            else:
+                linear_vel_value_limit = 0.0
+                angular_vel_value_limit = np.clip(KP_ANG * heading_error, -0.25, 0.25)
+
+        else:
+            # -----------------------------
+            # Nominal tracking
+            # -----------------------------
+            slow_scale = min(1.0, dist / SLOW_RADIUS)
+            linear_vel_value = KP_LIN * dx * slow_scale
+
+            # 후진 허용. 후진 막고 싶으면 0.0으로 바꾸면 됨.
+            linear_vel_value = np.clip(linear_vel_value, -MAXV, MAXV)
+
+            angular_vel_value = KP_ANG * path_angle
+
+            # goal 근처에서는 회전도 줄임
+            angular_scale = min(1.0, max(0.3, dist / SLOW_RADIUS))
+            angular_vel_value *= angular_scale
+            angular_vel_value = np.clip(angular_vel_value, -MAXW, MAXW)
+
+            # curvature 보존하면서 (v, w) saturation
+            if np.abs(linear_vel_value) <= MAXV:
+                if np.abs(angular_vel_value) <= MAXW:
+                    linear_vel_value_limit = linear_vel_value
+                    angular_vel_value_limit = angular_vel_value
+                else:
+                    rd = linear_vel_value / (angular_vel_value + 1e-8)
+                    linear_vel_value_limit = MAXW * np.sign(linear_vel_value) * np.abs(rd)
+                    angular_vel_value_limit = MAXW * np.sign(angular_vel_value)
+            else:
+                if np.abs(angular_vel_value) <= 1e-3:
+                    linear_vel_value_limit = MAXV * np.sign(linear_vel_value)
+                    angular_vel_value_limit = 0.0
+                else:
+                    rd = linear_vel_value / angular_vel_value
+                    if np.abs(rd) >= MAXV / MAXW:
+                        linear_vel_value_limit = MAXV * np.sign(linear_vel_value)
+                        angular_vel_value_limit = (
+                            MAXV * np.sign(angular_vel_value) / np.abs(rd)
+                        )
+                    else:
+                        linear_vel_value_limit = (
+                            MAXW * np.sign(linear_vel_value) * np.abs(rd)
+                        )
+                        angular_vel_value_limit = MAXW * np.sign(angular_vel_value)
+
+        return float(linear_vel_value_limit), float(angular_vel_value_limit)
+    
     def predict_action(self, pose_dict: dict, image_b64: str):
         robot_pose_world = (
             float(pose_dict["x"]),
@@ -556,62 +661,22 @@ class OmniVLAClient:
         chosen_waypoint[:2] *= self.metric_waypoint_spacing
         dx, dy, hx, hy = chosen_waypoint
 
-        DT = 1.0 / self.tick_rate
-        EPS = 1e-8
-
-        if np.abs(dx) < EPS and np.abs(dy) < EPS:
-            linear_vel_value = 0.0
-            angular_vel_value = self._wrap_angle(np.arctan2(hy, hx)) / DT
-        elif np.abs(dx) < EPS:
-            linear_vel_value = 0.0
-            angular_vel_value = np.sign(dy) * np.pi / (2.0 * DT)
-        else:
-            linear_vel_value = dx / DT
-            angular_vel_value = np.arctan2(dy, dx) / DT
-
-        linear_vel_value = np.clip(linear_vel_value, 0.0, 0.5)
-        angular_vel_value = np.clip(angular_vel_value, -1.0, 1.0)
-
-        maxv, maxw = 0.3, 0.3
-        if np.abs(linear_vel_value) <= maxv:
-            if np.abs(angular_vel_value) <= maxw:
-                linear_vel_value_limit = linear_vel_value
-                angular_vel_value_limit = angular_vel_value
-            else:
-                rd = linear_vel_value / (angular_vel_value + 1e-8)
-                linear_vel_value_limit = maxw * np.sign(linear_vel_value) * np.abs(rd)
-                angular_vel_value_limit = maxw * np.sign(angular_vel_value)
-        else:
-            if np.abs(angular_vel_value) <= 1e-3:
-                linear_vel_value_limit = maxv * np.sign(linear_vel_value)
-                angular_vel_value_limit = 0.0
-            else:
-                rd = linear_vel_value / angular_vel_value
-                if np.abs(rd) >= maxv / maxw:
-                    linear_vel_value_limit = maxv * np.sign(linear_vel_value)
-                    angular_vel_value_limit = (
-                        maxv * np.sign(angular_vel_value) / np.abs(rd)
-                    )
-                else:
-                    linear_vel_value_limit = (
-                        maxw * np.sign(linear_vel_value) * np.abs(rd)
-                    )
-                    angular_vel_value_limit = maxw * np.sign(angular_vel_value)
-
+        cmd_vel_v, cmd_vel_w = self.compute_cmd_vel_from_waypoint(dx, dy, hx, hy)
+                        
         self.save_robot_behavior(
             current_image_PIL=current_image_PIL,
             goal_img=self.goal_image_PIL,
             goal_pose=goal_pose_loc_norm,
             waypoints=waypoints[0],
-            linear_vel=float(linear_vel_value_limit),
-            angular_vel=float(angular_vel_value_limit),
+            linear_vel=float(cmd_vel_v),
+            angular_vel=float(cmd_vel_w),
             metric_waypoint_spacing=self.metric_waypoint_spacing,
             mask_number=modality_id.cpu().numpy(),
         )
 
         return (
-            float(linear_vel_value_limit),
-            float(angular_vel_value_limit),
+            float(cmd_vel_v),
+            float(cmd_vel_w),
             float(goal_distance),
         )
 
@@ -699,18 +764,61 @@ def main():
     SIM_PORT = 8765
     CMD_PORT = 8766
 
+    HOLD_SECONDS_BEFORE_RESET = 3.0
+    HOLD_CMD_DT = 0.1
+
+    STOP_LINEAR = 0.02
+    STOP_ANGULAR = 0.02
+    STOP_COUNT_THRESH = 15
+
+    LOOP_SLEEP_DT = 0.01
+
     sim = JsonSocketClient(ISAACSIM_HOST, SIM_PORT)
     cmd_sender = JsonLineSender(ISAACSIM_HOST, CMD_PORT)
-    cli = OmniVLAClient(goal="marker1", save_dir="./results")
+    cli = OmniVLAClient(goal="marker3", save_dir="./results")
+
+    episode_idx = cli.get_next_episode_index()
+    global_step = 0
+    episode_step = 0
+    stop_counter = 0
+
+    def hold_still(duration_sec: float):
+        hold_start = time.time()
+        while time.time() - hold_start < duration_sec:
+            cmd_sender.send({"linear": 0.0, "angular": 0.0})
+            time.sleep(HOLD_CMD_DT)
+
+    def start_new_episode(ep_idx: int):
+        cli.set_episode_save_dir(ep_idx)
+        reset_resp = sim.request({"cmd": "reset"})
+        print(f"[SIM RESET][EP {ep_idx:03d}] {reset_resp}")
+        return reset_resp
 
     try:
         ping = sim.request({"cmd": "ping"})
         print("[SIM PING]", ping)
 
-        reset_resp = sim.request({"cmd": "reset"})
-        print("[SIM RESET]", reset_resp)
+        start_new_episode(episode_idx)
 
-        for step in range(600):
+        while True:
+            # -----------------------------
+            # keyboard reset
+            # -----------------------------
+            if select.select([sys.stdin], [], [], 0)[0]:
+                key = sys.stdin.readline().strip()
+
+                if key == "r":
+                    print("[MANUAL RESET]")
+
+                    hold_still(1.0)
+
+                    episode_idx += 1
+                    episode_step = 0
+                    stop_counter = 0
+
+                    start_new_episode(episode_idx)
+                    continue
+                
             obs = sim.request({"cmd": "get_obs"})
             if not obs.get("ok", False):
                 raise RuntimeError(obs)
@@ -720,28 +828,50 @@ def main():
                 obs["image_b64"],
             )
 
+            is_stop_cmd = (
+                abs(linear) < STOP_LINEAR and abs(angular) < STOP_ANGULAR
+            )
+            if is_stop_cmd:
+                stop_counter += 1
+            else:
+                stop_counter = 0
+
             print(
-                f"[STEP {step:04d}] "
-                f"v={linear:.3f}, w={angular:.3f}, goal_dist={goal_distance:.3f}"
+                f"[EP {episode_idx:03d} | EP_STEP {episode_step:05d} | STEP {global_step:07d}] "
+                f"v={linear:.3f}, w={angular:.3f}, goal_dist={goal_distance:.3f}, "
+                f"stop_count={stop_counter}"
             )
 
-            if goal_distance < 0.25:
-                cmd_sender.send({"linear": 0.0, "angular": 0.0})
-                print("[DONE] Goal reached.")
-                break
-
             cmd_sender.send({"linear": linear, "angular": angular})
-            time.sleep(0.01)
+
+            if stop_counter >= STOP_COUNT_THRESH:
+                print(
+                    f"[DONE][EP {episode_idx:03d}] "
+                    f"STOP command detected for {STOP_COUNT_THRESH} consecutive steps. "
+                    f"Holding still for {HOLD_SECONDS_BEFORE_RESET:.1f}s before reset..."
+                )
+
+                hold_still(HOLD_SECONDS_BEFORE_RESET)
+
+                episode_idx += 1
+                episode_step = 0
+                stop_counter = 0
+
+                start_new_episode(episode_idx)
+                continue
+
+            episode_step += 1
+            global_step += 1
+            time.sleep(LOOP_SLEEP_DT)
 
     finally:
         try:
-            cmd_sender.send({"linear": 0.0, "angular": 0.0})
+            hold_still(0.3)
         except Exception:
             pass
 
         cmd_sender.close()
         sim.close()
-
 
 if __name__ == "__main__":
     main()

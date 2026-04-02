@@ -27,3 +27,4 @@ omnivla-edge/
 **/wandb/
 
 dataset/
+inference/finetune_model/results/

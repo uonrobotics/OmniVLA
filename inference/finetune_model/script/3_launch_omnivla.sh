@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
+
+#*** [ 192.168.0.154 ] ***#
+
 set -e
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate omnivla
+# Using UV environment
+source .venv/bin/activate
 
-python /home/sujin/workspace/physical-ai/OmniVLA/inference/finetune_model/omnivla_client.py
+python /home/uon/sujinkim/OmniVLA/inference/finetune_model/omnivla_client.py
