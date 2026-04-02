@@ -190,8 +190,8 @@ def init_module(
 
 class InferenceConfig:
     resume: bool = True
-    vla_path: str = "/nas/sujinkim/model/goto/sim/20260323_224/run#2/omnivla-original-balance--350000_chkpt/"
-    resume_step: Optional[int] = 350000
+    vla_path: str = "/nas/sujinkim/model/goto/sim/20260323_224/run#2/omnivla-original-balance--400000_chkpt/"
+    resume_step: Optional[int] = 400000
     use_l1_regression: bool = True
     use_diffusion: bool = False
     use_film: bool = False
@@ -265,7 +265,7 @@ def define_model(cfg: InferenceConfig):
 # OmniVLA client
 # ===============================================================
 class OmniVLAClient:
-    def __init__(self, goal: str = "marker1", save_dir: str = "./results"):
+    def __init__(self, goal: str = "marker1", save_dir: str = "./results", tick_rate: float = 3.0):
         if goal not in goal_poses:
             raise ValueError(f"Unknown goal: {goal}")
 
@@ -278,7 +278,7 @@ class OmniVLAClient:
             else f"What action should the robot take to go to {goal}?"
         )
         self.metric_waypoint_spacing = WAYPOINT_SPACING
-        self.tick_rate = 3
+        self.tick_rate = tick_rate
         self.count_id = 0
 
         self.base_save_dir = save_dir
@@ -552,88 +552,52 @@ class OmniVLAClient:
     # Policy
     # ===========================================================
     def compute_cmd_vel_from_waypoint(self, dx: float, dy: float, hx: float, hy: float):
-        DT = 1.0 / self.tick_rate
         EPS = 1e-8
+        DT = 1 / self.tick_rate
 
-        # -----------------------------
-        # Tunable controller params
-        # -----------------------------
-        POS_DEADBAND = 0.03          # m
-        YAW_DEADBAND = 0.10          # rad
-        SLOW_RADIUS = 0.25           # m
+        if np.abs(dx) < EPS and np.abs(dy) < EPS:
+            linear_vel_value = 0
+            angular_vel_value = clip_angle(np.arctan2(hy, hx)) / DT
 
-        KP_LIN = 1.2
-        KP_ANG = 1.5
-
-        MAXV = 0.8
-        MAXW = 0.7
-
-        def clip_angle(theta: float) -> float:
-            return math.atan2(math.sin(theta), math.cos(theta))
-
-        # predicted waypoint heading
-        heading_error = clip_angle(np.arctan2(hy, hx))
-
-        # waypoint position error
-        dist = float(np.hypot(dx, dy))
-        path_angle = float(np.arctan2(dy, dx)) if dist > EPS else 0.0
-
-        # -----------------------------
-        # Near-goal behavior
-        # -----------------------------
-        if dist < POS_DEADBAND:
-            if abs(heading_error) < YAW_DEADBAND:
-                linear_vel_value_limit = 0.0
-                angular_vel_value_limit = 0.0
-            else:
-                linear_vel_value_limit = 0.0
-                angular_vel_value_limit = np.clip(KP_ANG * heading_error, -0.25, 0.25)
+        elif np.abs(dx) < EPS:
+            linear_vel_value = 0
+            angular_vel_value = np.sign(dy) * np.pi / (2 * DT)
 
         else:
-            # -----------------------------
-            # Nominal tracking
-            # -----------------------------
-            slow_scale = min(1.0, dist / SLOW_RADIUS)
-            linear_vel_value = KP_LIN * dx * slow_scale
+            linear_vel_value = dx / DT
+            angular_vel_value = np.arctan(dy / dx) / DT
 
-            # 후진 허용. 후진 막고 싶으면 0.0으로 바꾸면 됨.
-            linear_vel_value = np.clip(linear_vel_value, -MAXV, MAXV)
+        # allow backward
+        linear_vel_value = np.clip(linear_vel_value, -1.0, 1.0)
+        angular_vel_value = np.clip(angular_vel_value, -1.5, 1.5)
 
-            angular_vel_value = KP_ANG * path_angle
+        # velocity limitation
+        maxv, maxw = 0.8, 0.7
 
-            # goal 근처에서는 회전도 줄임
-            angular_scale = min(1.0, max(0.3, dist / SLOW_RADIUS))
-            angular_vel_value *= angular_scale
-            angular_vel_value = np.clip(angular_vel_value, -MAXW, MAXW)
-
-            # curvature 보존하면서 (v, w) saturation
-            if np.abs(linear_vel_value) <= MAXV:
-                if np.abs(angular_vel_value) <= MAXW:
-                    linear_vel_value_limit = linear_vel_value
-                    angular_vel_value_limit = angular_vel_value
-                else:
-                    rd = linear_vel_value / (angular_vel_value + 1e-8)
-                    linear_vel_value_limit = MAXW * np.sign(linear_vel_value) * np.abs(rd)
-                    angular_vel_value_limit = MAXW * np.sign(angular_vel_value)
+        if np.abs(linear_vel_value) <= maxv:
+            if np.abs(angular_vel_value) <= maxw:
+                linear_vel_value_limit = linear_vel_value
+                angular_vel_value_limit = angular_vel_value
             else:
-                if np.abs(angular_vel_value) <= 1e-3:
-                    linear_vel_value_limit = MAXV * np.sign(linear_vel_value)
-                    angular_vel_value_limit = 0.0
+                rd = linear_vel_value / angular_vel_value
+                linear_vel_value_limit = maxw * np.sign(linear_vel_value) * np.abs(rd)
+                angular_vel_value_limit = maxw * np.sign(angular_vel_value)
+        else:
+            if np.abs(angular_vel_value) <= 0.001:
+                linear_vel_value_limit = maxv * np.sign(linear_vel_value)
+                angular_vel_value_limit = 0.0
+            else:
+                rd = linear_vel_value / angular_vel_value
+                if np.abs(rd) >= maxv / maxw:
+                    linear_vel_value_limit = maxv * np.sign(linear_vel_value)
+                    angular_vel_value_limit = maxv * np.sign(angular_vel_value) / np.abs(rd)
                 else:
-                    rd = linear_vel_value / angular_vel_value
-                    if np.abs(rd) >= MAXV / MAXW:
-                        linear_vel_value_limit = MAXV * np.sign(linear_vel_value)
-                        angular_vel_value_limit = (
-                            MAXV * np.sign(angular_vel_value) / np.abs(rd)
-                        )
-                    else:
-                        linear_vel_value_limit = (
-                            MAXW * np.sign(linear_vel_value) * np.abs(rd)
-                        )
-                        angular_vel_value_limit = MAXW * np.sign(angular_vel_value)
+                    linear_vel_value_limit = maxw * np.sign(linear_vel_value) * np.abs(rd)
+                    angular_vel_value_limit = maxw * np.sign(angular_vel_value)
 
         return float(linear_vel_value_limit), float(angular_vel_value_limit)
     
+        
     def predict_action(self, pose_dict: dict, image_b64: str):
         robot_pose_world = (
             float(pose_dict["x"]),
@@ -663,21 +627,22 @@ class OmniVLAClient:
 
         cmd_vel_v, cmd_vel_w = self.compute_cmd_vel_from_waypoint(dx, dy, hx, hy)
                         
-        self.save_robot_behavior(
-            current_image_PIL=current_image_PIL,
-            goal_img=self.goal_image_PIL,
-            goal_pose=goal_pose_loc_norm,
-            waypoints=waypoints[0],
-            linear_vel=float(cmd_vel_v),
-            angular_vel=float(cmd_vel_w),
-            metric_waypoint_spacing=self.metric_waypoint_spacing,
-            mask_number=modality_id.cpu().numpy(),
-        )
+        vis_payload = {
+            "current_image_PIL": current_image_PIL,
+            "goal_img": self.goal_image_PIL,
+            "goal_pose": goal_pose_loc_norm,
+            "waypoints": waypoints[0],
+            "linear_vel": float(cmd_vel_v),
+            "angular_vel": float(cmd_vel_w),
+            "metric_waypoint_spacing": self.metric_waypoint_spacing,
+            "mask_number": modality_id.cpu().numpy(),
+        }
 
         return (
             float(cmd_vel_v),
             float(cmd_vel_w),
             float(goal_distance),
+            vis_payload,
         )
 
     # ===========================================================
@@ -771,16 +736,30 @@ def main():
     STOP_ANGULAR = 0.02
     STOP_COUNT_THRESH = 15
 
-    LOOP_SLEEP_DT = 0.01
+    LOOP_SLEEP_DT = 0.005
+
+    INFER_HZ = 3.0
+    SAVE_FPS = 30.0
+
+    INFER_DT = 1.0 / INFER_HZ      # 0.2 sec
+    SAVE_DT = 1.0 / SAVE_FPS       # 0.0333 sec
 
     sim = JsonSocketClient(ISAACSIM_HOST, SIM_PORT)
     cmd_sender = JsonLineSender(ISAACSIM_HOST, CMD_PORT)
-    cli = OmniVLAClient(goal="marker3", save_dir="./results")
+    cli = OmniVLAClient(goal="marker3", save_dir="./results", tick_rate=INFER_HZ)
 
     episode_idx = cli.get_next_episode_index()
     global_step = 0
     episode_step = 0
     stop_counter = 0
+
+    last_infer_time = 0.0
+    last_save_time = 0.0
+
+    latest_linear = 0.0
+    latest_angular = 0.0
+    latest_goal_distance = float("inf")
+    latest_vis_payload = None
 
     def hold_still(duration_sec: float):
         hold_start = time.time()
@@ -789,9 +768,20 @@ def main():
             time.sleep(HOLD_CMD_DT)
 
     def start_new_episode(ep_idx: int):
+        nonlocal last_infer_time, last_save_time
+        nonlocal latest_linear, latest_angular, latest_goal_distance, latest_vis_payload
+
         cli.set_episode_save_dir(ep_idx)
         reset_resp = sim.request({"cmd": "reset"})
         print(f"[SIM RESET][EP {ep_idx:03d}] {reset_resp}")
+
+        last_infer_time = 0.0
+        last_save_time = 0.0
+        latest_linear = 0.0
+        latest_angular = 0.0
+        latest_goal_distance = float("inf")
+        latest_vis_payload = None
+
         return reset_resp
 
     try:
@@ -801,9 +791,8 @@ def main():
         start_new_episode(episode_idx)
 
         while True:
-            # -----------------------------
-            # keyboard reset
-            # -----------------------------
+            now = time.time()
+
             if select.select([sys.stdin], [], [], 0)[0]:
                 key = sys.stdin.readline().strip()
 
@@ -818,31 +807,53 @@ def main():
 
                     start_new_episode(episode_idx)
                     continue
-                
+
             obs = sim.request({"cmd": "get_obs"})
             if not obs.get("ok", False):
                 raise RuntimeError(obs)
 
-            linear, angular, goal_distance = cli.predict_action(
-                obs["pose"],
-                obs["image_b64"],
-            )
+            # -----------------------------
+            # 5 Hz inference
+            # -----------------------------
+            if now - last_infer_time >= INFER_DT:
+                (
+                    latest_linear,
+                    latest_angular,
+                    latest_goal_distance,
+                    latest_vis_payload,
+                ) = cli.predict_action(
+                    obs["pose"],
+                    obs["image_b64"],
+                )
 
-            is_stop_cmd = (
-                abs(linear) < STOP_LINEAR and abs(angular) < STOP_ANGULAR
-            )
-            if is_stop_cmd:
-                stop_counter += 1
-            else:
-                stop_counter = 0
+                cmd_sender.send(
+                    {"linear": latest_linear, "angular": latest_angular}
+                )
 
-            print(
-                f"[EP {episode_idx:03d} | EP_STEP {episode_step:05d} | STEP {global_step:07d}] "
-                f"v={linear:.3f}, w={angular:.3f}, goal_dist={goal_distance:.3f}, "
-                f"stop_count={stop_counter}"
-            )
+                is_stop_cmd = (
+                    abs(latest_linear) < STOP_LINEAR and abs(latest_angular) < STOP_ANGULAR
+                )
+                if is_stop_cmd:
+                    stop_counter += 1
+                else:
+                    stop_counter = 0
 
-            cmd_sender.send({"linear": linear, "angular": angular})
+                print(
+                    f"[EP {episode_idx:03d} | EP_STEP {episode_step:05d} | STEP {global_step:07d}] "
+                    f"v={latest_linear:.3f}, w={latest_angular:.3f}, "
+                    f"goal_dist={latest_goal_distance:.3f}, stop_count={stop_counter}"
+                )
+
+                episode_step += 1
+                global_step += 1
+                last_infer_time = now
+
+            # -----------------------------
+            # 30 FPS save
+            # -----------------------------
+            if latest_vis_payload is not None and (now - last_save_time >= SAVE_DT):
+                cli.save_robot_behavior(**latest_vis_payload)
+                last_save_time = now
 
             if stop_counter >= STOP_COUNT_THRESH:
                 print(
@@ -860,8 +871,6 @@ def main():
                 start_new_episode(episode_idx)
                 continue
 
-            episode_step += 1
-            global_step += 1
             time.sleep(LOOP_SLEEP_DT)
 
     finally:
