@@ -12,7 +12,7 @@ from isaacsim import SimulationApp
 
 simulation_app = SimulationApp(
     {
-        "headless": True,
+        "headless": False,
         "fast_shutdown": True,
     }
 )
@@ -38,7 +38,8 @@ from isaacsim.sensors.camera import Camera
 from omni.isaac.core.articulations import Articulation
 from omni.isaac.core.utils.extensions import enable_extension
 
-ENV_USD_PATH = "/nas/sujinkim/data/goto/sim/goto_warehouse.usd"
+# ENV_USD_PATH = "/nas/sujinkim/data/goto/sim/goto_warehouse.usd"
+ENV_USD_PATH = "/nas/sujinkim/data/goto/sim/goto_warehouse_extra_obstacles.usd"
 ROBOT_REL_PATH = "/Isaac/Samples/ROS2/Robots/Nova_Carter_ROS.usd"
 
 ENV_PRIM_PATH = "/World/env"
@@ -184,6 +185,15 @@ class JsonSocketServer:
         self.client = None
         self.buffer = b""
 
+    def _drop_client(self):
+        if self.client is not None:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+        self.client = None
+        self.buffer = b""
+
     def poll_accept(self):
         if self.client is not None:
             return
@@ -199,26 +209,68 @@ class JsonSocketServer:
         self.poll_accept()
         if self.client is None:
             return None
-        readable, _, _ = select.select([self.client], [], [], 0.0)
+
+        try:
+            readable, _, exceptional = select.select([self.client], [], [self.client], 0.0)
+        except (OSError, ValueError):
+            self._drop_client()
+            return None
+
+        if exceptional:
+            print("[IPC] client socket exception during select")
+            self._drop_client()
+            return None
+
         if not readable:
             return None
-        data = self.client.recv(10_000_000)
-        if not data:
-            self.client.close()
-            self.client = None
-            self.buffer = b""
+
+        try:
+            data = self.client.recv(10_000_000)
+        except (BlockingIOError, InterruptedError):
             return None
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            print(f"[IPC] recv failed, dropping client: {e}")
+            self._drop_client()
+            return None
+
+        if not data:
+            print("[IPC] client disconnected")
+            self._drop_client()
+            return None
+
         self.buffer += data
         if b"\n" not in self.buffer:
             return None
+
         line, self.buffer = self.buffer.split(b"\n", 1)
-        return json.loads(line.decode("utf-8"))
 
-    def send_message(self, payload: dict):
+        if not line.strip():
+            return None
+
+        try:
+            return json.loads(line.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            print(f"[IPC] bad json from client: {e}")
+            return None
+
+    def send_message(self, payload: dict) -> bool:
         if self.client is None:
-            raise RuntimeError("No client connected")
-        self.client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            return False
 
+        try:
+            self.client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            return True
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            print(f"[IPC] send failed, dropping client: {e}")
+            self._drop_client()
+            return False
+
+    def close(self):
+        self._drop_client()
+        try:
+            self.server.close()
+        except Exception:
+            pass
 
 class IsaacSimServer:
     def __init__(self):
@@ -417,29 +469,41 @@ def main():
 
     try:
         while simulation_app.is_running():
-            simulation_app.update()
-            msg = server.recv_message()
-            if msg is None:
-                continue
-
-            cmd = msg.get("cmd")
             try:
+                simulation_app.update()
+                msg = server.recv_message()
+                if msg is None:
+                    continue
+
+                cmd = msg.get("cmd")
+
                 if cmd == "ping":
                     server.send_message({"ok": True, "msg": "pong"})
+
                 elif cmd == "reset":
                     pose = sim.reset_robot_random_pose()
                     server.send_message({"ok": True, "pose": pose})
+
                 elif cmd == "get_obs":
                     pose = sim.get_pose()
                     image_b64 = sim.get_rgb_base64()
                     server.send_message({"ok": True, "pose": pose, "image_b64": image_b64})
+
                 else:
                     server.send_message({"ok": False, "error": f"unknown cmd: {cmd}"})
+
             except Exception as e:
-                server.send_message({"ok": False, "error": str(e)})
+                print(f"[IPC] loop error: {e}")
+                try:
+                    server.send_message({"ok": False, "error": str(e)})
+                except Exception:
+                    pass
+                continue
+
     finally:
         if sim.timeline is not None:
             sim.timeline.stop()
+        server.close()
         simulation_app.close()
 
 
