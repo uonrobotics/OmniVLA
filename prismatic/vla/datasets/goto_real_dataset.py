@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 from prismatic.vla.constants import IGNORE_INDEX
 
 
-class GotoSim_Dataset(Dataset):
+class GotoReal_Dataset(Dataset):
     """
     Raw data structure
     --------------------------
@@ -74,11 +74,26 @@ class GotoSim_Dataset(Dataset):
         min_future_gap: int = 12, 
         max_future_gap: int = 60,
         context_frames: int = 5,
-        predict_stop_token: bool = False, # TODO: ??
+        predict_stop_token: bool = True,
         use_flip_aug: bool = False,
         goal_source_probs: Optional[Dict[str, float]] = None,
         modality_probs: Optional[Dict[str, float]] = None,
         allowed_goal_sources: Optional[Dict[str, Sequence[str]]] = None,
+        
+        # ---------------------------
+        # AsyncVLA settings
+        # ---------------------------
+        use_async_aug: bool = True, # True for AsyncVLA
+        obs_delay_min: int = 1,
+        obs_delay_max: int = 12,
+        long_delay_prob: float = 0.20,
+        long_delay_min: int = 12,
+        long_delay_max: int = 25,
+        use_meaningful_delay_filter: bool = True,
+        meaningful_delay_prob: float = 0.80,
+        meaningful_horizon_idx: int = 7,
+        meaningful_threshold: float = 1.5,
+        max_resample_trials: int = 8,
     ):
         self.root_dir = Path(root_dir)
         self.image_transform = image_transform
@@ -98,18 +113,25 @@ class GotoSim_Dataset(Dataset):
         
         if goal_source_probs is None:
             goal_source_probs = {
-                "future": 0.6,
-                "destination": 0.4,
+                "future": 0.3,
+                "destination": 0.7,
             }
 
         if modality_probs is None:
             modality_probs = {
                 "pose_only": 0.10,       # MOD 4
-                "image_pose": 0.45,      # MOD 5
-                "image_only": 0.20,      # MOD 6
+                "image_pose": 0.20,      # MOD 5
+                "image_only": 0.45,      # MOD 6
                 "language_only": 0.05,   # MOD 7
                 "language_pose": 0.20,   # MOD 8
             }
+            # modality_probs = {
+            #     "pose_only": 0.15,       # MOD 4
+            #     "image_pose": 0.40,      # MOD 5
+            #     "image_only": 0.45,      # MOD 6
+            #     "language_only": 0.0,   # MOD 7
+            #     "language_pose": 0.0,   # MOD 8
+            # }
 
         if allowed_goal_sources is None:
             allowed_goal_sources = {
@@ -139,9 +161,21 @@ class GotoSim_Dataset(Dataset):
             combo_name: tuple(allowed_goal_sources[combo_name])
             for combo_name in allowed_goal_sources
         }
+        
+        self.use_async_aug = use_async_aug
+        self.obs_delay_min = obs_delay_min
+        self.obs_delay_max = obs_delay_max
+        self.long_delay_prob = long_delay_prob
+        self.long_delay_min = long_delay_min
+        self.long_delay_max = long_delay_max
+        self.use_meaningful_delay_filter = use_meaningful_delay_filter
+        self.meaningful_delay_prob = meaningful_delay_prob
+        self.meaningful_horizon_idx = meaningful_horizon_idx
+        self.meaningful_threshold = meaningful_threshold
+        self.max_resample_trials = max_resample_trials
 
-        self.action_root = self.root_dir / "goto" / "sim_v1_224rgb" / "action"
-        self.rgb_root = self.root_dir / "goto" / "sim_v1_224rgb" / "rgb"
+        self.action_root = self.root_dir / "goto" / "real_v2" / "action"
+        self.rgb_root = self.root_dir / "goto" / "real_v2" / "rgb"
 
         self.episodes: List[Dict[str, Any]] = self._load_episode_jsons(self.action_root)
         self.samples: List[Dict[str, Any]] = self._build_sample_index(self.episodes)
@@ -526,6 +560,52 @@ class GotoSim_Dataset(Dataset):
             labels[-1] = IGNORE_INDEX
             
         return input_ids, labels
+    
+    def _sample_obs_delay(self, t: int) -> int:
+        """
+        Sample stale observation delay in frames.
+        """
+        if not self.use_async_aug:
+            return 0
+
+        if random.random() < self.long_delay_prob:
+            lt = random.randint(self.long_delay_min, self.long_delay_max)
+        else:
+            lt = random.randint(self.obs_delay_min, self.obs_delay_max)
+
+        return min(lt, t)
+
+
+    def _delay_is_meaningful(
+        self,
+        traj_pose_list: Sequence[Tuple[float, float, float]],
+        t_cur: int,
+        t_obs: int,
+        max_goal_idx: Optional[int],
+    ) -> bool:
+        """
+        Check whether stale observation actually changes the trajectory enough
+        to be useful for AsyncVLA training.
+        """
+        if t_obs == t_cur:
+            return True
+
+        actions_cur = self._global_traj_to_relative_actions(
+            traj_pose_list,
+            start_idx=t_cur,
+            horizon=self.action_horizon,
+            max_goal_idx=max_goal_idx,
+        )
+        actions_obs = self._global_traj_to_relative_actions(
+            traj_pose_list,
+            start_idx=t_obs,
+            horizon=self.action_horizon,
+            max_goal_idx=max_goal_idx,
+        )
+
+        k = min(self.meaningful_horizon_idx, self.action_horizon - 1)
+        dist = np.linalg.norm(actions_cur[k, 0:2] - actions_obs[k, 0:2])
+        return dist > self.meaningful_threshold
 
     # ---------------------------------------------------------------------
     # Main sample creation
@@ -541,25 +621,14 @@ class GotoSim_Dataset(Dataset):
         final_goal_pose = sample["goal_pose"]
         sample_id = sample["sample_id"]
 
-        # 1) history frames + current state/image 
-        cur_frame_idx = traj[t]["index"]
-        current_img_np = self._load_rgb_frame(goal_name, episode_id, cur_frame_idx)
-        current_world = (
-            traj[t]["map_pose"]["x"],
-            traj[t]["map_pose"]["y"],
-            traj[t]["map_pose"]["yaw"],
-        )
-        
-        history_frames: List[torch.Tensor] = []
-        for k in range(self.context_frames, -1, -1):
-            frame_idx = max(0, cur_frame_idx - k)
-            img_np = self._load_rgb_frame(goal_name, episode_id, frame_idx)
-            img_t = torch.from_numpy(img_np).permute(2, 0, 1)
-            img_t = self._resize_norm(img_t, self.image_size)
-            history_frames.append(img_t)
-        cur_image = torch.cat(history_frames, dim=0)  # [C*(context_frames+1), H, W]
+        traj_pose_list = [
+            (step["map_pose"]["x"], step["map_pose"]["y"], step["map_pose"]["yaw"])
+            for step in traj
+        ]
 
-        # 2) choose goal image / goal pose source
+        # ------------------------------------------------------------
+        # 1) choose modality / goal source first
+        # ------------------------------------------------------------
         sample_case = self._sample_training_case()
         goal_source = sample_case["goal_source"]
         lan_prompt = sample_case["lan_prompt"]
@@ -575,43 +644,121 @@ class GotoSim_Dataset(Dataset):
                 g = min(len(traj) - 1, t + 1)
             else:
                 g = random.randint(min_future, max_future)
-            
-            goal_frame_idx = traj[g]["index"]
-            goal_img_np = self._load_rgb_frame(goal_name, episode_id, goal_frame_idx)
-            goal_world = (
-                traj[g]["map_pose"]["x"],
-                traj[g]["map_pose"]["y"],
-                traj[g]["map_pose"]["yaw"],
-            )
+            max_action_goal_idx = g
 
         elif goal_source == "destination":
-            # use the last frame of the episode as destination image
             g = len(traj) - 1
-            goal_frame_idx = traj[g]["index"]
+            max_action_goal_idx = None
+
+        else:
+            raise ValueError(f"Unsupported goal_source: {goal_source}")
+
+        # ------------------------------------------------------------
+        # 2) sample stale observation delay
+        # ------------------------------------------------------------
+        if self.use_async_aug:
+            chosen = False
+            for _ in range(self.max_resample_trials):
+                lt = self._sample_obs_delay(t)
+                t_obs = max(0, t - lt)
+
+                if (
+                    not self.use_meaningful_delay_filter
+                    or random.random() > self.meaningful_delay_prob
+                    or self._delay_is_meaningful(
+                        traj_pose_list=traj_pose_list,
+                        t_cur=t,
+                        t_obs=t_obs,
+                        max_goal_idx=max_action_goal_idx,
+                    )
+                ):
+                    chosen = True
+                    break
+
+            if not chosen:
+                lt = 0
+                t_obs = t
+        else:
+            lt = 0
+            t_obs = t
+
+        # ------------------------------------------------------------
+        # 3) current / stale state
+        # ------------------------------------------------------------
+        cur_frame_idx = traj[t]["index"]
+        obs_frame_idx = traj[t_obs]["index"]
+
+        obs_world = (
+            traj[t_obs]["map_pose"]["x"],
+            traj[t_obs]["map_pose"]["y"],
+            traj[t_obs]["map_pose"]["yaw"],
+        )
+
+        current_img_np = self._load_rgb_frame(goal_name, episode_id, cur_frame_idx)
+        obs_img_np = self._load_rgb_frame(goal_name, episode_id, obs_frame_idx)
+
+        # ------------------------------------------------------------
+        # 4) temporal history stack (keep current-centered)
+        # ------------------------------------------------------------
+        history_frames: List[torch.Tensor] = []
+        for k in range(self.context_frames, -1, -1):
+            frame_idx = max(0, cur_frame_idx - k)
+            img_np = self._load_rgb_frame(goal_name, episode_id, frame_idx)
+            img_t = torch.from_numpy(img_np).permute(2, 0, 1)
+            img_t = self._resize_norm(img_t, self.image_size)
+            history_frames.append(img_t)
+        cur_image = torch.cat(history_frames, dim=0)
+
+        # ------------------------------------------------------------
+        # 5) base VLA input = stale observation
+        # ------------------------------------------------------------
+        pil_obs = Image.fromarray(obs_img_np.astype(np.uint8)).resize(self.image_size_clip)
+        pixel_values = self.image_transform(pil_obs)
+
+        # async head inputs
+        p_image = self._resize_norm(
+            torch.from_numpy(obs_img_np).permute(2, 0, 1),
+            self.image_size,
+        )
+        c_image = self._resize_norm(
+            torch.from_numpy(current_img_np).permute(2, 0, 1),
+            self.image_size,
+        )
+
+        # ------------------------------------------------------------
+        # 6) goal image / goal pose aligned to stale observation
+        # ------------------------------------------------------------
+        if goal_source == "future":
+            g_obs = max(t_obs, g - lt)
+            goal_frame_idx = traj[g_obs]["index"]
             goal_img_np = self._load_rgb_frame(goal_name, episode_id, goal_frame_idx)
-            goal_world = (
+            goal_world_obs = (
+                traj[g_obs]["map_pose"]["x"],
+                traj[g_obs]["map_pose"]["y"],
+                traj[g_obs]["map_pose"]["yaw"],
+            )
+            max_action_goal_idx = g_obs
+            
+        else:
+            # destination: keep world goal as final destination, but use delayed-aligned goal image
+            g_obs = max(0, g - lt)
+            goal_frame_idx = traj[g_obs]["index"]
+            goal_img_np = self._load_rgb_frame(goal_name, episode_id, goal_frame_idx)
+            goal_world_obs = (
                 final_goal_pose["x"],
                 final_goal_pose["y"],
                 final_goal_pose["yaw"],
             )
 
-        else:
-            raise ValueError(f"Unsupported goal_source: {goal_source}")
-
-        # 3) goal pose from world -> relative
+        # pose conditioning is computed in stale-observation frame
         goal_pose_cos_sin, obj_pose_norm, goal_distance = self._world_to_relative_pose(
-            current_world,
-            goal_world,
+            obs_world,
+            goal_world_obs,
         )
 
-        # 4) build action chunk from global waypoints
-        traj_pose_list = [
-            (step["map_pose"]["x"], step["map_pose"]["y"], step["map_pose"]["yaw"])
-            for step in traj
-        ]
-
-        max_action_goal_idx = g if goal_source == "future" else None
-
+        # ------------------------------------------------------------
+        # 7) GT actions are still current-time targets
+        # ------------------------------------------------------------
         actions_np = self._global_traj_to_relative_actions(
             traj_pose_list,
             start_idx=t,
@@ -620,11 +767,10 @@ class GotoSim_Dataset(Dataset):
         )
         actions = torch.as_tensor(actions_np, dtype=torch.float32)
 
-        # 5) image transforms
-        pil_img = Image.fromarray(current_img_np.astype(np.uint8)).resize(self.image_size_clip)
+        # ------------------------------------------------------------
+        # 8) goal image transforms
+        # ------------------------------------------------------------
         pil_goal = Image.fromarray(goal_img_np.astype(np.uint8)).resize(self.image_size_clip)
-
-        pixel_values = self.image_transform(pil_img)
         pixel_values_goal = self.image_transform(pil_goal)
 
         goal_image_8 = self._resize_norm(
@@ -632,7 +778,9 @@ class GotoSim_Dataset(Dataset):
             self.image_size,
         )
 
-        # 6) mask out unused modalities
+        # ------------------------------------------------------------
+        # 9) modality masking
+        # ------------------------------------------------------------
         if not lan_prompt:
             language_instruction = "No language instruction"
 
@@ -670,15 +818,20 @@ class GotoSim_Dataset(Dataset):
             obj_pose_norm = np.zeros(2, dtype=np.float32)
 
         if not image_goal:
-            pil_goal = pil_img
+            pil_goal = pil_obs
             pixel_values_goal = torch.zeros_like(pixel_values_goal)
             goal_image_8 = torch.zeros_like(goal_image_8)
 
-        # 7) optional horizontal flip
+        # ------------------------------------------------------------
+        # 10) flip augmentation
+        # ------------------------------------------------------------
         if self.use_flip_aug and random.random() > 0.5:
             cur_image = torch.flip(cur_image, [2])
-            pil_img = pil_img.transpose(Image.FLIP_LEFT_RIGHT)
-            pixel_values = self.image_transform(pil_img)
+            c_image = torch.flip(c_image, [2])
+            p_image = torch.flip(p_image, [2])
+
+            pil_obs = pil_obs.transpose(Image.FLIP_LEFT_RIGHT)
+            pixel_values = self.image_transform(pil_obs)
 
             if image_goal:
                 goal_image_8 = torch.flip(goal_image_8, [2])
@@ -697,22 +850,26 @@ class GotoSim_Dataset(Dataset):
                 actions[:, 1] = -actions[:, 1]
                 actions[:, 3] = -actions[:, 3]
 
-        # 8) build prompt + labels
+        # ------------------------------------------------------------
+        # 11) prompt + labels
+        # ------------------------------------------------------------
         input_ids, labels = self._build_prompt_and_labels(language_instruction, actions)
 
         return dict(
-            pixel_values=pixel_values,
+            pixel_values=pixel_values,   # stale image for base VLA
             pixel_values_goal=pixel_values_goal,
             input_ids=input_ids,
             labels=labels,
-            dataset_name="goto/sim",
+            dataset_name="goto/real",
             modality_id=modality_id,
-            actions=actions,
+            actions=actions,             # current-time action target
             action_select_mask=torch.tensor(1.0),
             goal_pose=torch.as_tensor(goal_pose_cos_sin, dtype=torch.float32),
             obj_pose_norm=torch.as_tensor(obj_pose_norm, dtype=torch.float32),
-            img_PIL=pil_img,
+            img_PIL=pil_obs,
             gimg_PIL=pil_goal,
+            p_image=p_image,             # delayed obs image
+            c_image=c_image,             # current image
             cur_image=cur_image,
             goal_image_8=goal_image_8,
             temp_dist=goal_distance,

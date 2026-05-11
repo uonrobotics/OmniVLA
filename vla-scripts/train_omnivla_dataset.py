@@ -7,8 +7,8 @@ Train or finetune OmniVLA with LoRA.
 # ==============================
 # Configuration Flags
 # ==============================
-TRAIN_MODE = False   # True: training mode, False: debug mode (minimize GPU RAM usage)
-VISUALIZE = True    # True: save visualization images of policy performance
+TRAIN_MODE = True   # True: training mode, False: debug mode (minimize GPU RAM usage)
+VISUALIZE = False    # True: save visualization images of policy performance
 
 # ==============================
 # Path Setup
@@ -110,6 +110,7 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 # from prismatic.vla.datasets.bdd_dataset import BDD_Dataset
 # from prismatic.vla.datasets.cast_dataset import CAST_Dataset
 from prismatic.vla.datasets.goto_sim_dataset import GotoSim_Dataset
+from prismatic.vla.datasets.goto_real_dataset import GotoReal_Dataset
 # from prismatic.vla.datasets.frodobots_dataset import Frodobots_Dataset, EpisodeSampler_Frodobots
 
 from vint_train.models.exaug.exaug import ExAug_dist_delay
@@ -1107,6 +1108,45 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
                 sampler=sampler_train_gotosim,
                 generator=g if cfg.inference_seed is not None else None,
             )
+        
+        #Goto real dataset
+        if data_split_type == "train":
+            dataset_gotoreal = GotoReal_Dataset(
+                root_dir=cfg.data_root_dir,
+                image_transform=processor.image_processor.apply_transform,
+                action_tokenizer=action_tokenizer,
+                prompt_builder_fn=PurePromptBuilder,
+                base_tokenizer=processor.tokenizer,
+            )
+            
+            train_dataset_gotoreal = []
+            train_dataset_gotoreal.append(dataset_gotoreal)
+            train_dataset_gotoreal = ConcatDataset(train_dataset_gotoreal)
+            
+            sampler_train_gotoreal = DistributedSampler(
+                train_dataset_gotoreal,
+                num_replicas=world_size,
+                rank=device_id,
+                shuffle=True,
+                seed=cfg.inference_seed if cfg.inference_seed is not None else 0,
+            )
+            
+            if cfg.inference_seed is not None:
+                g = torch.Generator()
+                g.manual_seed(cfg.inference_seed)
+            
+            train_loader_gotoreal = DataLoader(
+                train_dataset_gotoreal,
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                collate_fn=collator,
+                num_workers=config["num_workers"],
+                drop_last=True,
+                persistent_workers=True,
+                sampler=sampler_train_gotoreal,
+                generator=g if cfg.inference_seed is not None else None,
+            )
+            
              
         # #CAST dataset 
         # if data_split_type == "train":
@@ -1358,8 +1398,8 @@ def train_omnivla(cfg: OmniVLAConfig) -> None:
     #You can list all your training datasets. Following with 5 datasets does not work on Nvidia 4090, due to the memory limitation. You need to reduce the number of the data loader.    
     # iters = [iter(train_loader_gnm), iter(train_loader_lelan), iter(train_loader_frodobots), iter(train_loader_bdd), iter(train_loader_CAST)]
     # samplers = [sampler_train_gnm, sampler_train_lelan, sampler_train_frodobots, sampler_train_bdd, sampler_train_cast]          
-    iters = [iter(train_loader_gotosim)]
-    samplers = [sampler_train_gotosim]
+    iters = [iter(train_loader_gotoreal)]
+    samplers = [sampler_train_gotoreal]
                                  
     log_count = 0
     for epoch in range(100):
